@@ -1,5 +1,6 @@
 import sys
 import json
+import time  # <-- for reconnect backoff
 import serial
 try:
     import yaml
@@ -66,16 +67,42 @@ class SerialWorker(QObject):
         self._running = True
         self.serial_port = None
 
-    def start(self):
+    def _open_port(self):
+        """Try to open the port if closed. Return True on success."""
+        if self.serial_port and getattr(self.serial_port, "is_open", False):
+            return True
         try:
             self.serial_port = serial.Serial(self.port, self.baudrate, timeout=1)
             print(f"[INFO] Opened serial {self.port} @ {self.baudrate}")
+            return True
         except serial.SerialException as e:
-            print(f"[ERROR] Could not open serial port: {e}")
-            return
+            print(f"[WARN] Could not open serial port {self.port}: {e}")
+            return False
+        except Exception as e:
+            print(f"[WARN] Unexpected error opening serial: {e}")
+            return False
 
+    def _close_port(self):
+        try:
+            if self.serial_port and getattr(self.serial_port, "is_open", False):
+                self.serial_port.close()
+                print("[INFO] Serial port closed")
+        except Exception:
+            pass
+        finally:
+            self.serial_port = None
+
+    def start(self):
+        """Read loop with periodic auto-reconnect."""
+        backoff = 1.0  # seconds
         buffer = ""
+
         while self._running:
+            # Ensure port is open; if not, keep trying periodically
+            if not self._open_port():
+                time.sleep(backoff)
+                continue
+
             try:
                 line = self.serial_port.readline().decode('utf-8', errors='ignore')
                 if not line:
@@ -86,23 +113,38 @@ class SerialWorker(QObject):
                     self.data_received.emit(json_data)
                     buffer = ""
                 except json.JSONDecodeError:
+                    # Non-JSON line; ignore
                     continue
-            except Exception as e:
+
+            except (serial.SerialException, OSError) as e:
+                # Device reset/unplug or bad fd; close and retry
                 print(f"[ERROR] Error reading serial: {e}")
+                self._close_port()
+                time.sleep(backoff)
+                continue
+            except Exception as e:
+                print(f"[ERROR] Unexpected read error: {e}")
+                self._close_port()
+                time.sleep(backoff)
+                continue
+
+        # Cleanup on thread exit
+        self._close_port()
 
     def stop(self):
         self._running = False
-        try:
-            if self.serial_port and self.serial_port.is_open:
-                self.serial_port.close()
-        except Exception:
-            pass
+        # read loop will exit and close port
 
-    # >>> Same as your provided file <<<
+    # Keep send logic exactly like your original file
     def send_command(self, cmd):
         if self.serial_port and self.serial_port.is_open:
-            self.serial_port.write((cmd + "\n").encode('utf-8'))
-            print(f"[INFO] Sent command: {cmd}")
+            try:
+                self.serial_port.write((cmd + "\n").encode('utf-8'))
+                print(f"[INFO] Sent command: {cmd}")
+            except Exception as e:
+                print(f"[ERROR] Failed to send command: {e}")
+        else:
+            print("[WARN] Serial port not open; cannot send.")
 
 
 class TableViewer(QWidget):
@@ -340,15 +382,13 @@ class App(QWidget):
         value = str(value).strip()
         if not value:
             return
-        # Direct call to worker, same as your original code
-        self.worker.send_command(value)
+        self.worker.send_command(value)  # same as original logic
         self.cmd_history.addItem(value)
 
     def send_command(self):
         cmd = self.cmd_input.text().strip()
         if cmd:
-            # Direct call to worker, same as your original code
-            self.worker.send_command(cmd)
+            self.worker.send_command(cmd)  # same as original logic
             self.cmd_history.addItem(cmd)
             self.cmd_input.clear()
 
