@@ -1,0 +1,27 @@
+COM: "/dev/ttyUSB0"         # or "/dev/ttyUSB0"
+BAUD: 500000        # optional; defaults to 500000
+buttons:
+  - name: "Service Mode On"
+    value: "{\"command\": \"service_mode_on\"}"
+  - name: "Service Mode Off"
+    value: "{\"command\": \"service_mode_off\"}"
+  - name: "Charger On"
+    value: "{\"command\": \"charger_on\"}"
+  - name: "Charger Off"
+    value: "{\"command\": \"charger_off\"}"
+  - name: "Set Charging 1A"
+    value: "{\"command\": \"set_current\", \"value\": 1}"
+  - name: "Set Charging 2A"
+    value: "{\"command\": \"set_current\", \"value\": 2}"
+  - name: "Set Charging 4A"
+    value: "{\"command\": \"set_current\", \"value\": 4}"
+  - name: "Set Charging 8A"
+    value: "{\"command\": \"set_current\", \"value\": 8}"
+  - name: "Set Charging 12A" 
+    value: "{\"command\": \"set_current\", \"value\": 12}"
+  - name: "Balancing On"
+    value: "{\"command\": \"balancing_on\"}"
+  - name: "Balancing Off"
+    value: "{\"command\": \"balancing_off\"}"
+  
+
