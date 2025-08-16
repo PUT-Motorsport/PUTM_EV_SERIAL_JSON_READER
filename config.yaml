@@ -1,5 +1,11 @@
 COM: "/dev/ttyUSB0"         # or "/dev/ttyUSB0"
-BAUD: 500000        # optional; defaults to 500000
+BAUD: 250000        # optional; defaults to 500000
+precision: 3     # max digits after the dot for floats in tables
+heatmaps:
+  - name: "cell_voltages"
+    max_deviation: 0.02   # ±5%
+  - name: "cell_temperatures"
+    max_deviation: 2   # ±10%
 buttons:
   - name: "Service Mode On"
     value: "{\"command\": \"service_mode_on\"}"

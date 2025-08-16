@@ -1,6 +1,5 @@
 import sys
 import json
-import time  # <-- for reconnect backoff
 import serial
 try:
     import yaml
@@ -19,7 +18,17 @@ from PyQt5.QtCore import Qt, QObject, QThread, pyqtSignal
 
 def load_config(path="config.yaml"):
     """Load YAML configuration if available. Returns dict with defaults."""
-    cfg = {"COM": "/dev/ttyUSB0", "BAUD": 500000, "buttons": []}
+    cfg = {
+        "COM": "/dev/ttyUSB0",
+        "BAUD": 500000,
+        "buttons": [],
+        "precision": 3,
+        # Preferred: per-table rules
+        "heatmaps": None,          # list of {"name": str, "max_deviation": float}
+        # Legacy fallbacks (used only if 'heatmaps' not provided)
+        "heatmap_tables": None,    # list[str] or str
+        "max_deviation": 0.05
+    }
     if not path:
         return cfg
     try:
@@ -49,6 +58,50 @@ def load_config(path="config.yaml"):
                     else:
                         print(f"[WARN] Skipping button with missing name/value: {item}")
                 cfg["buttons"] = norm
+
+            # Precision (accepts "precision" or "PRECISION")
+            prec_key = "precision" if "precision" in data else ("PRECISION" if "PRECISION" in data else None)
+            if prec_key is not None:
+                try:
+                    p = int(data[prec_key])
+                    if p < 0:
+                        raise ValueError
+                    cfg["precision"] = p
+                except Exception:
+                    print("[WARN] Invalid precision in YAML; using default 3")
+
+            # Preferred: 'heatmaps' per-table list
+            if "heatmaps" in data and isinstance(data["heatmaps"], list):
+                hm = []
+                for entry in data["heatmaps"]:
+                    if isinstance(entry, dict):
+                        name = str(entry.get("name", "")).strip()
+                        try:
+                            md = float(entry.get("max_deviation", cfg["max_deviation"]))
+                        except Exception:
+                            md = cfg["max_deviation"]
+                        if name:
+                            hm.append({"name": name, "max_deviation": max(0.0, md)})
+                cfg["heatmaps"] = hm if hm else None
+
+            # Legacy fallbacks (only if no 'heatmaps' provided)
+            if cfg["heatmaps"] is None:
+                if "heatmap_tables" in data:
+                    ht = data["heatmap_tables"]
+                    if isinstance(ht, str):
+                        cfg["heatmap_tables"] = [ht]
+                    elif isinstance(ht, list):
+                        cfg["heatmap_tables"] = [str(x) for x in ht if x]
+                    else:
+                        cfg["heatmap_tables"] = None
+                if "max_deviation" in data:
+                    try:
+                        md = float(data["max_deviation"])
+                        if md < 0:
+                            raise ValueError
+                        cfg["max_deviation"] = md
+                    except Exception:
+                        print("[WARN] Invalid max_deviation in YAML; using default 0.05")
     except FileNotFoundError:
         # silent fallback to defaults
         pass
@@ -67,42 +120,16 @@ class SerialWorker(QObject):
         self._running = True
         self.serial_port = None
 
-    def _open_port(self):
-        """Try to open the port if closed. Return True on success."""
-        if self.serial_port and getattr(self.serial_port, "is_open", False):
-            return True
+    def start(self):
         try:
             self.serial_port = serial.Serial(self.port, self.baudrate, timeout=1)
             print(f"[INFO] Opened serial {self.port} @ {self.baudrate}")
-            return True
         except serial.SerialException as e:
-            print(f"[WARN] Could not open serial port {self.port}: {e}")
-            return False
-        except Exception as e:
-            print(f"[WARN] Unexpected error opening serial: {e}")
-            return False
+            print(f"[ERROR] Could not open serial port: {e}")
+            return
 
-    def _close_port(self):
-        try:
-            if self.serial_port and getattr(self.serial_port, "is_open", False):
-                self.serial_port.close()
-                print("[INFO] Serial port closed")
-        except Exception:
-            pass
-        finally:
-            self.serial_port = None
-
-    def start(self):
-        """Read loop with periodic auto-reconnect."""
-        backoff = 1.0  # seconds
         buffer = ""
-
         while self._running:
-            # Ensure port is open; if not, keep trying periodically
-            if not self._open_port():
-                time.sleep(backoff)
-                continue
-
             try:
                 line = self.serial_port.readline().decode('utf-8', errors='ignore')
                 if not line:
@@ -113,43 +140,36 @@ class SerialWorker(QObject):
                     self.data_received.emit(json_data)
                     buffer = ""
                 except json.JSONDecodeError:
-                    # Non-JSON line; ignore
                     continue
-
-            except (serial.SerialException, OSError) as e:
-                # Device reset/unplug or bad fd; close and retry
-                print(f"[ERROR] Error reading serial: {e}")
-                self._close_port()
-                time.sleep(backoff)
-                continue
             except Exception as e:
-                print(f"[ERROR] Unexpected read error: {e}")
-                self._close_port()
-                time.sleep(backoff)
-                continue
-
-        # Cleanup on thread exit
-        self._close_port()
+                print(f"[ERROR] Error reading serial: {e}")
 
     def stop(self):
         self._running = False
-        # read loop will exit and close port
+        try:
+            if self.serial_port and self.serial_port.is_open:
+                self.serial_port.close()
+        except Exception:
+            pass
 
-    # Keep send logic exactly like your original file
+    # >>> Same as your provided file <<<
     def send_command(self, cmd):
         if self.serial_port and self.serial_port.is_open:
-            try:
-                self.serial_port.write((cmd + "\n").encode('utf-8'))
-                print(f"[INFO] Sent command: {cmd}")
-            except Exception as e:
-                print(f"[ERROR] Failed to send command: {e}")
-        else:
-            print("[WARN] Serial port not open; cannot send.")
+            self.serial_port.write((cmd + "\n").encode('utf-8'))
+            print(f"[INFO] Sent command: {cmd}")
 
 
 class TableViewer(QWidget):
-    def __init__(self):
+    def __init__(self, precision=3, heatmap_rules=None, default_max_dev=0.05):
+        """
+        heatmap_rules: dict[str, float] mapping table name -> max_deviation (fraction).
+                       If None, apply to all tables using default_max_dev.
+        """
         super().__init__()
+        self.precision = int(precision) if precision is not None else 3
+        self.heatmap_rules = dict(heatmap_rules) if heatmap_rules else None
+        self.default_max_dev = float(default_max_dev) if default_max_dev is not None else 0.05
+
         layout = QVBoxLayout(self)
         layout.setContentsMargins(5, 5, 5, 5)
         layout.setSpacing(5)
@@ -182,7 +202,14 @@ class TableViewer(QWidget):
             for key, value in data.items():
                 if isinstance(value, list) and self.is_2d_array(value):
                     self.add_label(key + ":", bold=True)
-                    self.add_table(value)
+                    # Determine if/which rule applies
+                    max_dev = None
+                    if self.heatmap_rules is None:
+                        max_dev = self.default_max_dev  # apply to all
+                    elif key in self.heatmap_rules:
+                        max_dev = self.heatmap_rules[key]  # apply only if named
+                    # Render with optional heatmap
+                    self.add_table(value, max_dev=max_dev)
                 elif isinstance(value, (dict, list)):
                     self.render_data(value)
         elif isinstance(data, list):
@@ -200,10 +227,48 @@ class TableViewer(QWidget):
             label.setStyleSheet("font-weight: bold")
         self.content_layout.addWidget(label)
 
-    def add_table(self, table_data):
+    def _format_for_display(self, val):
+        """Format numeric values with up to `precision` decimals, trimming trailing zeros."""
+        try:
+            num = float(val)
+            s = f"{num:.{self.precision}f}"
+            if self.precision > 0:
+                s = s.rstrip('0').rstrip('.')
+            else:
+                s = s.split('.')[0]
+            return s
+        except Exception:
+            return str(val)
+
+    # --------- Color helpers for smooth gradients ----------
+    @staticmethod
+    def _lerp(a, b, t):
+        return int(a + (b - a) * max(0.0, min(1.0, t)))
+
+    @staticmethod
+    def _qcolor_from_rgb(r, g, b):
+        return QColor(int(r), int(g), int(b))
+
+    def _green_color(self, t):
+        """t in [0,1]; 0 = at avg (light), 1 = edge of green band (deeper)."""
+        # light green -> medium green (pleasant, readable)
+        r = self._lerp(234, 184, t)   # from #EAEAEA? No, pick #EAFBEA -> #B8F0B8
+        g = self._lerp(251, 240, t)
+        b = self._lerp(234, 184, t)
+        return self._qcolor_from_rgb(r, g, b)
+
+    def _red_color(self, t):
+        """t in [0,1]; 0 = just outside band (light red), 1 = far away (pleasant stronger red)."""
+        r = self._lerp(255, 255, t)   # keep red at 255
+        g = self._lerp(234, 140, t)   # #FFEAEA -> #FF8C8C
+        b = self._lerp(234, 140, t)
+        return self._qcolor_from_rgb(r, g, b)
+    # ------------------------------------------------------
+
+    def add_table(self, table_data, max_dev=None):
         rows, cols = len(table_data), len(table_data[0])
 
-        # compute heatmap thresholds
+        # compute average for heatmap
         nums = []
         for r in table_data:
             for v in r:
@@ -211,7 +276,7 @@ class TableViewer(QWidget):
                     nums.append(float(v))
                 except Exception:
                     pass
-        avg = sum(nums) / len(nums) if nums else 0
+        avg = sum(nums) / len(nums) if nums else 0.0
 
         table = QTableWidget(rows, cols)
         table.setVerticalHeaderLabels([str(i + 1) for i in range(rows)])
@@ -221,32 +286,35 @@ class TableViewer(QWidget):
         table.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
         table.setSizeAdjustPolicy(QAbstractScrollArea.AdjustToContents)
 
+        # Choose a cap so "far" deviations don't all look identical.
+        # Full-strength red at ~5x the band width.
+        red_cap_factor = 5.0
+
         for i in range(rows):
             for j in range(cols):
-                val = table_data[i][j]
-                item = QTableWidgetItem(str(val))
-                # heatmap
-                try:
-                    num = float(val)
-                    diff = abs(num - avg) / avg * 100 if avg else 0
-                    if diff <= 5:
-                        color = QColor(204, 255, 204)  # greenish
-                    elif diff <= 10:
-                        t = (diff - 5) / 5
-                        c = int(204 + (255 - 204) * t)
-                        color = QColor(c, 255, c)
-                    elif diff <= 50:
-                        # ramp toward red
-                        t = (diff - 10) / 40
-                        r = 255
-                        g = int(255 * (1 - t) + 204 * t)
-                        b = int(255 * (1 - t) + 204 * t)
-                        color = QColor(r, g, b)
-                    else:
-                        color = QColor(255, 204, 204)
-                    item.setBackground(color)
-                except Exception:
-                    pass
+                raw_val = table_data[i][j]
+                display_text = self._format_for_display(raw_val)
+                item = QTableWidgetItem(display_text)
+
+                if max_dev is not None and avg != 0:
+                    try:
+                        num = float(raw_val)
+                        diff = abs(num - avg) / abs(avg)  # relative deviation
+                        if diff <= max_dev:
+                            # Green fade: closer to avg -> lighter; at edge -> deeper
+                            t = diff / max_dev  # 0..1
+                            color = self._green_color(t)
+                            item.setBackground(color)
+                        else:
+                            # Red fade: just outside band -> light red; farther -> stronger red
+                            over = diff - max_dev
+                            denom = max(max_dev * red_cap_factor, 1e-12)
+                            t = max(0.0, min(1.0, over / denom))
+                            color = self._red_color(t)
+                            item.setBackground(color)
+                    except Exception:
+                        pass
+
                 table.setItem(i, j, item)
 
         table.resizeColumnsToContents()
@@ -264,17 +332,29 @@ class TableViewer(QWidget):
 
 
 class App(QWidget):
-    def __init__(self, port="/dev/ttyUSB0", baudrate=500000, buttons=None):
+    def __init__(self, port="/dev/ttyUSB0", baudrate=500000, buttons=None, precision=3,
+                 heatmaps=None, legacy_tables=None, legacy_max_dev=0.05):
         super().__init__()
         self.setWindowTitle("Serial JSON Monitor")
         self.setMinimumSize(1200, 600)
+
+        # Build heatmap rules dict[name] = max_deviation
+        rules = None
+        if heatmaps:  # preferred
+            rules = {str(h["name"]): float(h.get("max_deviation", legacy_max_dev)) for h in heatmaps if "name" in h}
+        elif legacy_tables:  # legacy
+            rules = {str(name): float(legacy_max_dev) for name in legacy_tables}
 
         main_layout = QHBoxLayout(self)
         main_layout.setContentsMargins(5, 5, 5, 5)
         main_layout.setSpacing(5)
 
         # Table section (RIGHT)
-        self.table_viewer = TableViewer()
+        self.table_viewer = TableViewer(
+            precision=precision,
+            heatmap_rules=rules,
+            default_max_dev=legacy_max_dev
+        )
         self.table_viewer.setMinimumWidth(1100)
         self.table_viewer.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Expanding)
         main_layout.addWidget(self.table_viewer)
@@ -322,6 +402,7 @@ class App(QWidget):
 
         # History
         cmd_layout.addWidget(QLabel("History:"))
+        self.cmd_history = QListWidget()
         cmd_layout.addWidget(self.cmd_history)
 
         cmd_panel = QWidget()
@@ -382,13 +463,15 @@ class App(QWidget):
         value = str(value).strip()
         if not value:
             return
-        self.worker.send_command(value)  # same as original logic
+        # Direct call to worker, same as your original code
+        self.worker.send_command(value)
         self.cmd_history.addItem(value)
 
     def send_command(self):
         cmd = self.cmd_input.text().strip()
         if cmd:
-            self.worker.send_command(cmd)  # same as original logic
+            # Direct call to worker, same as your original code
+            self.worker.send_command(cmd)
             self.cmd_history.addItem(cmd)
             self.cmd_input.clear()
 
@@ -447,9 +530,21 @@ if __name__ == "__main__":
     config_path = sys.argv[1] if len(sys.argv) > 1 else "config.yaml"
     cfg = load_config(config_path)
 
+    # Build args for App from cfg (handle preferred + legacy)
+    heatmaps = cfg.get("heatmaps")
+    legacy_tables = cfg.get("heatmap_tables")
+    legacy_max_dev = cfg.get("max_deviation", 0.05)
+
     app = QApplication(sys.argv)
-    win = App(cfg.get("COM", "/dev/ttyUSB0"),
-              cfg.get("BAUD", 500000),
-              cfg.get("buttons", []))
+    win = App(
+        cfg.get("COM", "/dev/ttyUSB0"),
+        cfg.get("BAUD", 500000),
+        cfg.get("buttons", []),
+        cfg.get("precision", 3),
+        heatmaps=heatmaps,
+        legacy_tables=legacy_tables,
+        legacy_max_dev=legacy_max_dev
+    )
     win.show()
     sys.exit(app.exec_())
+
