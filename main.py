@@ -1,6 +1,11 @@
 import sys
 import json
 import serial
+import csv
+import os
+from datetime import datetime
+import threading
+import time
 try:
     import yaml
 except ImportError:
@@ -119,6 +124,86 @@ class SerialWorker(QObject):
         self.baudrate = baudrate
         self._running = True
         self.serial_port = None
+        self._latest_data = None
+        self._csv_writer = None
+        self._csv_file = None
+        self._csv_lock = threading.Lock()
+        self._csv_thread = None
+        self._csv_header_written = False
+        self._csv_path = None
+        self._csv_header = []
+        self._recording = False
+
+    def start_recording(self):
+        with self._csv_lock:
+            if self._recording:
+                return
+            now = datetime.now()
+            filename = now.strftime("serial_log_%Y%m%d_%H%M%S.csv")
+            path = os.path.join(os.getcwd(), filename)
+            try:
+                self._csv_file = open(path, "w", newline='', encoding="utf-8")
+                self._csv_writer = csv.writer(self._csv_file)
+                self._csv_header_written = False
+                self._csv_path = path
+                self._recording = True
+            except Exception as e:
+                print(f"[ERROR] Could not create CSV file: {e}")
+                self._csv_file = None
+                self._csv_writer = None
+                self._recording = False
+
+    def stop_recording(self):
+        with self._csv_lock:
+            self._recording = False
+            self._csv_header_written = False
+            try:
+                if self._csv_file:
+                    self._csv_file.close()
+            except Exception:
+                pass
+            self._csv_file = None
+            self._csv_writer = None
+            self._csv_path = None
+
+    def _start_csv_thread(self):
+        def csv_loop():
+            while self._running:
+                time.sleep(1)
+                with self._csv_lock:
+                    if self._recording and self._csv_writer and self._latest_data is not None:
+                        self._write_csv_row(self._latest_data)
+        self._csv_thread = threading.Thread(target=csv_loop, daemon=True)
+        self._csv_thread.start()
+
+    def _flatten_json_for_csv(self, data):
+        flat = {}
+        for k, v in data.items():
+            if k in ("gpio_voltages", "cell_socs"):
+                continue
+            if k == "cell_voltages" and isinstance(v, list) and v and isinstance(v[0], list):
+                for row_idx, row in enumerate(v, 1):
+                    for col_idx, val in enumerate(row, 1):
+                        flat[f"cell_voltage_{row_idx}_{col_idx}"] = val
+            elif k == "cell_temperatures" and isinstance(v, list) and v and isinstance(v[0], list):
+                for row_idx, row in enumerate(v, 1):
+                    for col_idx, val in enumerate(row, 1):
+                        flat[f"cell_temperature_{row_idx}_{col_idx}"] = val
+            elif isinstance(v, (dict, list)):
+                flat[k] = json.dumps(v, ensure_ascii=False)
+            else:
+                flat[k] = v
+        return flat
+
+    def _write_csv_row(self, data):
+        flat = self._flatten_json_for_csv(data)
+        if not self._csv_header_written:
+            self._csv_header = list(flat.keys())
+            self._csv_writer.writerow(self._csv_header)
+            self._csv_header_written = True
+        row = [flat.get(col, "") for col in self._csv_header]
+        self._csv_writer.writerow(row)
+        self._csv_file.flush()
 
     def start(self):
         try:
@@ -128,6 +213,7 @@ class SerialWorker(QObject):
             print(f"[ERROR] Could not open serial port: {e}")
             return
 
+        self._start_csv_thread()
         buffer = ""
         while self._running:
             try:
@@ -137,6 +223,8 @@ class SerialWorker(QObject):
                 buffer = line
                 try:
                     json_data = json.loads(buffer)
+                    with self._csv_lock:
+                        self._latest_data = json_data
                     self.data_received.emit(json_data)
                     buffer = ""
                 except json.JSONDecodeError:
@@ -146,13 +234,13 @@ class SerialWorker(QObject):
 
     def stop(self):
         self._running = False
+        self.stop_recording()
         try:
             if self.serial_port and self.serial_port.is_open:
                 self.serial_port.close()
         except Exception:
             pass
 
-    # >>> Same as your provided file <<<
     def send_command(self, cmd):
         if self.serial_port and self.serial_port.is_open:
             self.serial_port.write((cmd + "\n").encode('utf-8'))
@@ -355,7 +443,7 @@ class App(QWidget):
             heatmap_rules=rules,
             default_max_dev=legacy_max_dev
         )
-        self.table_viewer.setMinimumWidth(1100)
+        self.table_viewer.setMinimumWidth(800)
         self.table_viewer.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Expanding)
         main_layout.addWidget(self.table_viewer)
 
@@ -404,6 +492,15 @@ class App(QWidget):
         cmd_layout.addWidget(QLabel("History:"))
         self.cmd_history = QListWidget()
         cmd_layout.addWidget(self.cmd_history)
+
+        # Add record/stop buttons
+        self.record_btn = QPushButton("Record Data")
+        self.stop_btn = QPushButton("Stop Recording")
+        self.stop_btn.setEnabled(False)
+        self.record_btn.clicked.connect(self.start_recording)
+        self.stop_btn.clicked.connect(self.stop_recording)
+        cmd_layout.addWidget(self.record_btn)
+        cmd_layout.addWidget(self.stop_btn)
 
         cmd_panel = QWidget()
         cmd_panel.setLayout(cmd_layout)
@@ -474,6 +571,16 @@ class App(QWidget):
             self.worker.send_command(cmd)
             self.cmd_history.addItem(cmd)
             self.cmd_input.clear()
+
+    def start_recording(self):
+        self.worker.start_recording()
+        self.record_btn.setEnabled(False)
+        self.stop_btn.setEnabled(True)
+
+    def stop_recording(self):
+        self.worker.stop_recording()
+        self.record_btn.setEnabled(True)
+        self.stop_btn.setEnabled(False)
 
     def update_view(self, data):
         self.table_viewer.display_tables(data)
