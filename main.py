@@ -3,6 +3,7 @@ import json
 import time
 import csv
 import os
+import re
 import threading
 import logging
 from datetime import datetime
@@ -32,7 +33,7 @@ from PyQt5.QtCore import Qt, QObject, QThread, pyqtSignal
 
 
 # ---------------------------------------------------------------------
-# Basic program logging: console messages for errors/info/debug
+# Basic program logging
 # ---------------------------------------------------------------------
 
 logging.basicConfig(
@@ -44,28 +45,54 @@ logger = logging.getLogger("serial_json_monitor")
 
 
 # ---------------------------------------------------------------------
-# Data logger: logs received JSON values and sent commands
+# Data logger
 # ---------------------------------------------------------------------
 
 class SerialDataLogger:
     """
-    Logs serial traffic.
-
     CSV mode:
-        One row per JSON value.
-        Format:
-            timestamp_iso,direction,port,path,value,raw_json
+        Keeps the CSV format flattened:
+            timestamp_iso,direction,port,path,value_text,value_number,is_numeric,raw_json
 
     MCAP mode:
-        One MCAP message per received JSON message or sent command.
-        Requires:
-            pip install mcap
+        Dynamically creates one topic per received JSON message type.
+
+        Example received JSON:
+            {"type": "imu", "ax": 1.2, "ay": 3.4}
+
+        MCAP topic:
+            /serial/imu
+
+        MCAP message:
+            {"type": "imu", "ax": 1.2, "ay": 3.4}
+
+        Repeated IMU messages continue going to:
+            /serial/imu
+
+        Another message:
+            {"type": "gps", "lat": 1.0, "lon": 2.0}
+
+        MCAP topic:
+            /serial/gps
     """
 
-    def __init__(self, log_dir="logs", log_format="csv", prefix="serial_log"):
+    def __init__(
+        self,
+        log_dir="logs",
+        log_format="csv",
+        prefix="serial_log",
+        mcap_topic_prefix="/serial",
+        mcap_default_topic="/serial/json",
+        mcap_topic_field=None
+    ):
         self.log_dir = log_dir or "logs"
         self.log_format = str(log_format or "csv").lower().strip()
         self.prefix = prefix or "serial_log"
+
+        self.mcap_topic_prefix = self._clean_topic_prefix(mcap_topic_prefix)
+        self.mcap_default_topic = self._clean_topic(mcap_default_topic or "/serial/json")
+        self.mcap_topic_field = str(mcap_topic_field).strip() if mcap_topic_field else None
+
         self.lock = threading.RLock()
         self.closed = False
 
@@ -78,7 +105,12 @@ class SerialDataLogger:
 
         self.mcap_file = None
         self.mcap_writer = None
-        self.mcap_channel_id = None
+
+        # topic -> channel_id
+        self.mcap_channels = {}
+
+        # topic -> schema_id
+        self.mcap_schemas = {}
 
         if self.log_format == "mcap":
             if MCAP_AVAILABLE:
@@ -97,65 +129,326 @@ class SerialDataLogger:
         self._open_csv(start_stamp)
         logger.info("CSV serial log file: %s", self.path)
 
+    # ------------------------------------------------------------
+    # File opening
+    # ------------------------------------------------------------
+
     def _open_csv(self, start_stamp):
         self.path = os.path.join(self.log_dir, f"{self.prefix}_{start_stamp}.csv")
+
         self.csv_file = open(self.path, "w", newline="", encoding="utf-8")
         self.csv_writer = csv.writer(self.csv_file)
+
         self.csv_writer.writerow([
             "timestamp_iso",
             "direction",
             "port",
             "path",
-            "value",
+            "value_text",
+            "value_number",
+            "is_numeric",
             "raw_json"
         ])
+
         self.csv_file.flush()
 
     def _open_mcap(self, start_stamp):
         self.path = os.path.join(self.log_dir, f"{self.prefix}_{start_stamp}.mcap")
+
         self.mcap_file = open(self.path, "wb")
         self.mcap_writer = McapWriter(self.mcap_file)
+
         self.mcap_writer.start(
             profile="jsonschema",
             library="pyqt_serial_json_monitor"
         )
 
-        schema = {
-            "type": "object",
-            "properties": {
-                "timestamp_iso": {"type": "string"},
-                "direction": {"type": "string"},
-                "port": {"type": "string"},
-                "path": {"type": "string"},
-                "value": {},
-                # "raw_json": {}
+        self.mcap_channels = {}
+        self.mcap_schemas = {}
+
+    # ------------------------------------------------------------
+    # MCAP topic and schema helpers
+    # ------------------------------------------------------------
+
+    def _clean_topic_prefix(self, prefix):
+        prefix = str(prefix or "/serial").strip()
+
+        if not prefix.startswith("/"):
+            prefix = "/" + prefix
+
+        prefix = prefix.rstrip("/")
+
+        if not prefix:
+            prefix = "/serial"
+
+        return prefix
+
+    def _clean_topic(self, topic):
+        topic = str(topic or self.mcap_default_topic).strip()
+
+        if not topic:
+            topic = self.mcap_default_topic
+
+        if not topic.startswith("/"):
+            topic = "/" + topic
+
+        topic = re.sub(r"[^A-Za-z0-9_/.-]+", "_", topic)
+        topic = re.sub(r"/+", "/", topic)
+
+        return topic
+
+    def _topic_from_json(self, data):
+        """
+        Dynamically choose topic from the JSON.
+
+        Priority:
+            1. Configured mcap_topic_field
+            2. mcap_topic
+            3. topic
+            4. type
+            5. message_type
+            6. name
+            7. default topic
+
+        Example:
+            {"type": "imu", "ax": 1.2}
+            -> /serial/imu
+        """
+        if not isinstance(data, dict):
+            return self.mcap_default_topic
+
+        topic_fields = []
+
+        if self.mcap_topic_field:
+            topic_fields.append(self.mcap_topic_field)
+
+        topic_fields.extend([
+            "mcap_topic",
+            "topic",
+            "type",
+            "message_type",
+            "name"
+        ])
+
+        for field in topic_fields:
+            if field not in data:
+                continue
+
+            value = data.get(field)
+
+            if isinstance(value, (dict, list)):
+                continue
+
+            value = str(value).strip()
+
+            if not value:
+                continue
+
+            if value.startswith("/"):
+                return self._clean_topic(value)
+
+            return self._clean_topic(f"{self.mcap_topic_prefix}/{value}")
+
+        return self.mcap_default_topic
+
+    def _json_type_for_value(self, value):
+        """
+        Convert Python value type to JSON schema type.
+        """
+        if isinstance(value, bool):
+            return {"type": "boolean"}
+
+        if isinstance(value, int) and not isinstance(value, bool):
+            return {"type": "integer"}
+
+        if isinstance(value, float):
+            return {"type": "number"}
+
+        if isinstance(value, str):
+            return {"type": "string"}
+
+        if value is None:
+            return {"type": "null"}
+
+        if isinstance(value, list):
+            if not value:
+                return {
+                    "type": "array",
+                    "items": {"type": "string"}
+                }
+
+            return {
+                "type": "array",
+                "items": self._json_type_for_value(value[0])
             }
-        }
+
+        if isinstance(value, dict):
+            properties = {}
+
+            for key, child_value in value.items():
+                properties[str(key)] = self._json_type_for_value(child_value)
+
+            return {
+                "type": "object",
+                "properties": properties,
+                "additionalProperties": True
+            }
+
+        return {"type": "string"}
+
+    def _schema_from_json(self, topic, data):
+        """
+        Build a Foxglove-friendly JSON schema from the first message on a topic.
+        """
+        schema_name = topic.strip("/").replace("/", "_").replace("-", "_").replace(".", "_")
+
+        schema = self._json_type_for_value(data)
+
+        if schema.get("type") != "object":
+            schema = {
+                "type": "object",
+                "properties": {
+                    "value": self._json_type_for_value(data)
+                },
+                "additionalProperties": True
+            }
+
+        schema["title"] = schema_name
+        schema["additionalProperties"] = True
+
+        return schema_name, schema
+
+    def _get_mcap_channel(self, topic, data):
+        """
+        Create one MCAP channel per dynamic topic.
+
+        The schema is created from the first message seen for that topic.
+        Later messages with the same type go to the same topic/channel.
+        """
+        topic = self._clean_topic(topic)
+
+        if topic in self.mcap_channels:
+            return self.mcap_channels[topic]
+
+        schema_name, schema = self._schema_from_json(topic, data)
 
         schema_id = self.mcap_writer.register_schema(
-            name="SerialEvent",
+            name=schema_name,
             encoding="jsonschema",
             data=json.dumps(schema).encode("utf-8")
         )
 
-        self.mcap_channel_id = self.mcap_writer.register_channel(
-            topic="/serial/events",
+        channel_id = self.mcap_writer.register_channel(
+            topic=topic,
             message_encoding="json",
             schema_id=schema_id
         )
 
+        self.mcap_schemas[topic] = schema_id
+        self.mcap_channels[topic] = channel_id
+
+        logger.info("Created MCAP topic: %s", topic)
+
+        return channel_id
+
+    def _write_mcap_json(self, topic, payload):
+        """
+        Write one full JSON payload to its dynamic topic.
+        """
+        now_ns = time.time_ns()
+        channel_id = self._get_mcap_channel(topic, payload)
+
+        data = json.dumps(payload, ensure_ascii=False).encode("utf-8")
+
+        self.mcap_writer.add_message(
+            channel_id=channel_id,
+            log_time=now_ns,
+            publish_time=now_ns,
+            data=data
+        )
+
+        try:
+            self.mcap_file.flush()
+        except Exception:
+            pass
+
+    # ------------------------------------------------------------
+    # MCAP payload helpers
+    # ------------------------------------------------------------
+
+    def _wrap_nested_arrays_for_foxglove(self, value, inside_array=False):
+        """
+        MCAP only.
+
+        Foxglove message paths do not handle raw nested arrays well.
+        This converts nested Python lists into an object format that can be
+        addressed like:
+
+            field.array[:].array[:]
+
+        Examples:
+
+            [[1, 2], [3, 4]]
+
+        becomes:
+
+            {
+                "array": [
+                    {"array": [1, 2]},
+                    {"array": [3, 4]}
+                ]
+            }
+
+        A normal 1D array that is not nested stays unchanged:
+
+            [1, 2, 3]
+
+        But a 1D array inside another array becomes:
+
+            {"array": [1, 2, 3]}
+        """
+        if isinstance(value, dict):
+            return {
+                str(key): self._wrap_nested_arrays_for_foxglove(child_value)
+                for key, child_value in value.items()
+            }
+
+        if isinstance(value, list):
+            contains_list = any(isinstance(item, list) for item in value)
+
+            if inside_array or contains_list:
+                return {
+                    "array": [
+                        self._wrap_nested_arrays_for_foxglove(
+                            item,
+                            inside_array=isinstance(item, list)
+                        )
+                        for item in value
+                    ]
+                }
+
+            return [
+                self._wrap_nested_arrays_for_foxglove(item)
+                for item in value
+            ]
+
+        return value
+
+    def _make_mcap_payload(self, data):
+        """
+        MCAP only.
+
+        Keeps the original JSON shape except nested arrays are rewritten to
+        Foxglove-friendly .array[:].array[:] objects. CSV logging is not
+        affected by this.
+        """
+        return self._wrap_nested_arrays_for_foxglove(data)
+
+    # ------------------------------------------------------------
+    # CSV helpers
+    # ------------------------------------------------------------
+
     def _flatten_json(self, data, prefix=""):
-        """
-        Turns nested JSON into path/value pairs.
-
-        Example:
-            {"a": {"b": 5}, "arr": [10, 20]}
-
-        Becomes:
-            a.b = 5
-            arr[0] = 10
-            arr[1] = 20
-        """
         values = []
 
         if isinstance(data, dict):
@@ -165,7 +458,7 @@ class SerialDataLogger:
 
         elif isinstance(data, list):
             for index, value in enumerate(data):
-                path = f"{prefix}[{index}]"
+                path = f"{prefix}[{index}]" if prefix else f"[{index}]"
                 values.extend(self._flatten_json(value, path))
 
         else:
@@ -173,38 +466,47 @@ class SerialDataLogger:
 
         return values
 
-    def _write_csv_row(self, timestamp_iso, direction, port, path, value, raw_json):
+    def _value_parts(self, value):
+        value_text = str(value)
+
+        if isinstance(value, bool):
+            return value_text, float(int(value)), True
+
+        try:
+            value_number = float(value)
+            return value_text, value_number, True
+        except Exception:
+            return value_text, 0.0, False
+
+    def _write_csv_row(
+        self,
+        timestamp_iso,
+        direction,
+        port,
+        path,
+        value_text,
+        value_number,
+        is_numeric,
+        raw_json
+    ):
         self.csv_writer.writerow([
             timestamp_iso,
             direction,
             port,
             path,
-            value,
-            # raw_json
+            value_text,
+            value_number,
+            is_numeric,
+            raw_json
         ])
+
         self.csv_file.flush()
 
-    def _write_mcap_event(self, event):
-        now_ns = time.time_ns()
-        data = json.dumps(event, ensure_ascii=False).encode("utf-8")
-
-        self.mcap_writer.add_message(
-            channel_id=self.mcap_channel_id,
-            log_time=now_ns,
-            publish_time=now_ns,
-            data=data
-        )
+    # ------------------------------------------------------------
+    # Public logging methods
+    # ------------------------------------------------------------
 
     def log_received(self, port, data):
-        """
-        Log received JSON.
-
-        In CSV mode:
-            Logs every scalar JSON value as a separate comma-separated row.
-
-        In MCAP mode:
-            Logs the whole JSON message as one MCAP event.
-        """
         timestamp_iso = datetime.now().isoformat(timespec="milliseconds")
         raw_json = json.dumps(data, ensure_ascii=False)
 
@@ -213,59 +515,50 @@ class SerialDataLogger:
                 return
 
             if self.log_format == "mcap":
-                event = {
-                    "timestamp_iso": timestamp_iso,
-                    "direction": "receive",
-                    "port": port,
-                    "path": "",
-                    "value": None,
-                    "raw_json": data
-                }
-                self._write_mcap_event(event)
+                topic = self._topic_from_json(data)
+                mcap_payload = self._make_mcap_payload(data)
+                self._write_mcap_json(topic, mcap_payload)
                 return
 
+            # CSV stays flattened exactly like before.
             flattened = self._flatten_json(data)
 
             if not flattened:
-                self._write_csv_row(
-                    timestamp_iso,
-                    "receive",
-                    port,
-                    "",
-                    "",
-                    raw_json
-                )
-                return
+                flattened = [("", "")]
 
             for path, value in flattened:
+                value_text, value_number, is_numeric = self._value_parts(value)
+
                 self._write_csv_row(
                     timestamp_iso,
                     "receive",
                     port,
                     path,
-                    value,
+                    value_text,
+                    value_number,
+                    is_numeric,
                     raw_json
                 )
 
     def log_send(self, port, command):
         timestamp_iso = datetime.now().isoformat(timespec="milliseconds")
 
+        payload = {
+            "timestamp_iso": timestamp_iso,
+            "direction": "send",
+            "port": port,
+            "command": command
+        }
+
+        raw_json = json.dumps(payload, ensure_ascii=False)
+        value_text, value_number, is_numeric = self._value_parts(command)
+
         with self.lock:
             if self.closed:
                 return
 
             if self.log_format == "mcap":
-                event = {
-                    "timestamp_iso": timestamp_iso,
-                    "direction": "send",
-                    "port": port,
-                    "path": "command",
-                    "value": command,
-                    "raw_json": {
-                        "command": command
-                    }
-                }
-                self._write_mcap_event(event)
+                self._write_mcap_json("/serial/commands", payload)
                 return
 
             self._write_csv_row(
@@ -273,30 +566,32 @@ class SerialDataLogger:
                 "send",
                 port,
                 "command",
-                command,
-                json.dumps({"command": command}, ensure_ascii=False)
+                value_text,
+                value_number,
+                is_numeric,
+                raw_json
             )
 
     def log_send_failed(self, port, command, error):
         timestamp_iso = datetime.now().isoformat(timespec="milliseconds")
+
+        payload = {
+            "timestamp_iso": timestamp_iso,
+            "direction": "send_failed",
+            "port": port,
+            "command": command,
+            "error": str(error)
+        }
+
+        raw_json = json.dumps(payload, ensure_ascii=False)
+        value_text, value_number, is_numeric = self._value_parts(command)
 
         with self.lock:
             if self.closed:
                 return
 
             if self.log_format == "mcap":
-                event = {
-                    "timestamp_iso": timestamp_iso,
-                    "direction": "send_failed",
-                    "port": port,
-                    "path": "command",
-                    "value": command,
-                    "raw_json": {
-                        "command": command,
-                        "error": str(error)
-                    }
-                }
-                self._write_mcap_event(event)
+                self._write_mcap_json("/serial/commands_failed", payload)
                 return
 
             self._write_csv_row(
@@ -304,14 +599,10 @@ class SerialDataLogger:
                 "send_failed",
                 port,
                 "command",
-                command,
-                json.dumps(
-                    {
-                        "command": command,
-                        "error": str(error)
-                    },
-                    ensure_ascii=False
-                )
+                value_text,
+                value_number,
+                is_numeric,
+                raw_json
             )
 
     def close(self):
@@ -329,6 +620,7 @@ class SerialDataLogger:
 
             try:
                 if self.mcap_file:
+                    self.mcap_file.flush()
                     self.mcap_file.close()
             except Exception:
                 pass
@@ -340,28 +632,27 @@ class SerialDataLogger:
             except Exception:
                 pass
 
-
 # ---------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------
 
 def load_config(path="config.yaml"):
-    """Load YAML configuration if available. Returns dict with defaults."""
     cfg = {
         "COM": "/dev/ttyUSB0",
         "BAUD": 500000,
         "buttons": [],
         "precision": 3,
 
-        # Logging
         "log_dir": "logs",
-        "log_format": "csv",       # "csv" or "mcap"
+        "log_format": "csv",
         "log_prefix": "serial_log",
 
-        # Preferred: per-table rules
-        "heatmaps": None,
+        # MCAP topic settings
+        "mcap_topic_prefix": "/serial",
+        "mcap_default_topic": "/serial/json",
+        "mcap_topic_field": None,
 
-        # Legacy fallbacks
+        "heatmaps": None,
         "heatmap_tables": None,
         "max_deviation": 0.05
     }
@@ -394,6 +685,7 @@ def load_config(path="config.yaml"):
 
         if "log_format" in data and isinstance(data["log_format"], str):
             fmt = data["log_format"].lower().strip()
+
             if fmt in ("csv", "mcap"):
                 cfg["log_format"] = fmt
             else:
@@ -402,8 +694,21 @@ def load_config(path="config.yaml"):
         if "log_prefix" in data and isinstance(data["log_prefix"], str) and data["log_prefix"]:
             cfg["log_prefix"] = data["log_prefix"]
 
+        if "mcap_topic_prefix" in data and isinstance(data["mcap_topic_prefix"], str) and data["mcap_topic_prefix"]:
+            cfg["mcap_topic_prefix"] = data["mcap_topic_prefix"]
+
+        if "mcap_default_topic" in data and isinstance(data["mcap_default_topic"], str) and data["mcap_default_topic"]:
+            cfg["mcap_default_topic"] = data["mcap_default_topic"]
+
+        if "mcap_topic_field" in data:
+            if data["mcap_topic_field"] is None:
+                cfg["mcap_topic_field"] = None
+            else:
+                cfg["mcap_topic_field"] = str(data["mcap_topic_field"]).strip() or None
+
         if "buttons" in data and isinstance(data["buttons"], list):
             norm = []
+
             for item in data["buttons"]:
                 if not isinstance(item, dict):
                     continue
@@ -423,9 +728,12 @@ def load_config(path="config.yaml"):
         if prec_key is not None:
             try:
                 p = int(data[prec_key])
+
                 if p < 0:
                     raise ValueError
+
                 cfg["precision"] = p
+
             except Exception:
                 logger.warning("Invalid precision in YAML; using default 3")
 
@@ -463,9 +771,12 @@ def load_config(path="config.yaml"):
             if "max_deviation" in data:
                 try:
                     md = float(data["max_deviation"])
+
                     if md < 0:
                         raise ValueError
+
                     cfg["max_deviation"] = md
+
                 except Exception:
                     logger.warning("Invalid max_deviation in YAML; using default 0.05")
 
@@ -498,7 +809,6 @@ class SerialWorker(QObject):
         self._lock = threading.RLock()
 
     def _close_port(self):
-        """Immediately disconnect from the current serial port."""
         with self._lock:
             sp = self.serial_port
             self.serial_port = None
@@ -512,7 +822,6 @@ class SerialWorker(QObject):
                     logger.warning("Error while closing serial port: %s", e)
 
     def _open_port(self):
-        """Try to open the configured serial port."""
         with self._lock:
             self.serial_port = serial.Serial(
                 self.port,
@@ -524,12 +833,12 @@ class SerialWorker(QObject):
             logger.info("Opened serial %s @ %s", self.port, self.baudrate)
 
     def _wait_before_reconnect(self):
-        """Wait a little before retrying, but allow fast shutdown."""
         steps = int(self.reconnect_delay * 10)
 
         for _ in range(max(1, steps)):
             if not self._running:
                 return
+
             time.sleep(0.1)
 
     def start(self):
@@ -667,13 +976,6 @@ class SerialWorker(QObject):
 
 class TableViewer(QWidget):
     def __init__(self, precision=3, heatmap_rules=None, default_max_dev=0.05):
-        """
-        heatmap_rules:
-            dict[str, float] mapping table name -> max_deviation.
-
-        If None:
-            heatmap is applied to all tables using default_max_dev.
-        """
         super().__init__()
 
         self.precision = int(precision) if precision is not None else 3
@@ -749,7 +1051,6 @@ class TableViewer(QWidget):
         self.content_layout.addWidget(label)
 
     def _format_for_display(self, val):
-        """Format numeric values with up to `precision` decimals."""
         try:
             num = float(val)
             s = f"{num:.{self.precision}f}"
@@ -915,7 +1216,6 @@ class App(QWidget):
         main_layout.setContentsMargins(5, 5, 5, 5)
         main_layout.setSpacing(5)
 
-        # Table section
         self.table_viewer = TableViewer(
             precision=precision,
             heatmap_rules=rules,
@@ -926,7 +1226,6 @@ class App(QWidget):
         self.table_viewer.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Expanding)
         main_layout.addWidget(self.table_viewer)
 
-        # Non-table section
         self.non_table_display = QScrollArea()
         self.non_table_display.setWidgetResizable(True)
         self.non_table_display.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
@@ -940,7 +1239,6 @@ class App(QWidget):
 
         main_layout.addWidget(self.non_table_display)
 
-        # Command section
         cmd_input = QLineEdit()
         cmd_btn = QPushButton("Send")
 
@@ -988,7 +1286,6 @@ class App(QWidget):
         main_layout.setStretchFactor(self.table_viewer, 1)
         main_layout.setStretchFactor(self.non_table_display, 2)
 
-        # Serial worker
         self.worker = SerialWorker(
             port=port,
             baudrate=baudrate,
@@ -1005,7 +1302,6 @@ class App(QWidget):
         self.build_quick_buttons(buttons or [])
 
     def build_quick_buttons(self, buttons):
-        """Create buttons from a list of {'name': ..., 'value': ...} dicts."""
         while self.quick_buttons_layout.count():
             item = self.quick_buttons_layout.takeAt(0)
             w = item.widget()
@@ -1042,7 +1338,6 @@ class App(QWidget):
                 row += 1
 
     def send_quick_command(self, value):
-        """Send quick command. Add to history only if sending succeeds."""
         value = str(value).strip()
 
         if not value:
@@ -1052,7 +1347,6 @@ class App(QWidget):
             self.cmd_history.addItem(value)
 
     def send_command(self):
-        """Send typed command. Add to history only if sending succeeds."""
         cmd = self.cmd_input.text().strip()
 
         if not cmd:
@@ -1142,7 +1436,10 @@ if __name__ == "__main__":
     serial_logger = SerialDataLogger(
         log_dir=cfg.get("log_dir", "logs"),
         log_format=cfg.get("log_format", "csv"),
-        prefix=cfg.get("log_prefix", "serial_log")
+        prefix=cfg.get("log_prefix", "serial_log"),
+        mcap_topic_prefix=cfg.get("mcap_topic_prefix", "/serial"),
+        mcap_default_topic=cfg.get("mcap_default_topic", "/serial/json"),
+        mcap_topic_field=cfg.get("mcap_topic_field", None)
     )
 
     app = QApplication(sys.argv)
