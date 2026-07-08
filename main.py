@@ -351,6 +351,11 @@ class TableViewer(QWidget):
         g = self._lerp(234, 140, t)   # #FFEAEA -> #FF8C8C
         b = self._lerp(234, 140, t)
         return self._qcolor_from_rgb(r, g, b)
+    def _violet_color(self, t):
+        r = self._lerp(255, 255, t)
+        g = self._lerp(234, 140, t)
+        b = self._lerp(234, 240, t)
+        return self._qcolor_from_rgb(r, g, b)
     # ------------------------------------------------------
 
     def add_table(self, table_data, max_dev=None):
@@ -387,18 +392,26 @@ class TableViewer(QWidget):
                 if max_dev is not None and avg != 0:
                     try:
                         num = float(raw_val)
-                        diff = abs(num - avg) / abs(avg)  # relative deviation
+                        diff_abs = abs(num - avg) / abs(avg)  # relative deviation
+                        diff = num - avg
                         if diff <= max_dev:
                             # Green fade: closer to avg -> lighter; at edge -> deeper
-                            t = diff / max_dev  # 0..1
+                            t = (diff_abs / max_dev) * -1 + 1  # 0..1
                             color = self._green_color(t)
                             item.setBackground(color)
-                        else:
+                        elif diff > max_dev:
                             # Red fade: just outside band -> light red; farther -> stronger red
-                            over = diff - max_dev
+                            over = diff_abs - max_dev
                             denom = max(max_dev * red_cap_factor, 1e-12)
                             t = max(0.0, min(1.0, over / denom))
                             color = self._red_color(t)
+                            item.setBackground(color)
+                        else:  # diff < -max_dev
+                            # Violet fade: just outside band -> light violet; farther -> stronger violet
+                            over = diff_abs - max_dev
+                            denom = max(max_dev * red_cap_factor, 1e-12)
+                            t = max(0.0, min(1.0, over / denom))
+                            color = self._violet_color(t)
                             item.setBackground(color)
                     except Exception:
                         pass
