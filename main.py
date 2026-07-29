@@ -826,8 +826,8 @@ class SerialWorker(QObject):
             self.serial_port = serial.Serial(
                 self.port,
                 self.baudrate,
-                timeout=0.2,
-                write_timeout=0.5
+                timeout=0.75,
+                write_timeout=0.75
             )
 
             logger.info("Opened serial %s @ %s", self.port, self.baudrate)
