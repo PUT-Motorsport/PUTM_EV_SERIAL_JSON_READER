@@ -25,7 +25,7 @@ except ImportError:
 from PyQt5.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout, QLabel, QTableWidget,
     QTableWidgetItem, QHeaderView, QScrollArea, QLineEdit, QPushButton,
-    QListWidget, QSizePolicy, QGridLayout, QFrame
+    QListWidget, QSizePolicy, QGridLayout, QFrame, QSplitter
 )
 from PyQt5.QtWidgets import QAbstractScrollArea
 from PyQt5.QtGui import QColor
@@ -1214,7 +1214,14 @@ class App(QWidget):
 
         main_layout = QHBoxLayout(self)
         main_layout.setContentsMargins(5, 5, 5, 5)
-        main_layout.setSpacing(5)
+        main_layout.setSpacing(0)
+
+        # Draggable horizontal splitter for the three main columns.
+        # Drag either separator to resize the neighboring columns.
+        self.main_splitter = QSplitter(Qt.Horizontal)
+        self.main_splitter.setChildrenCollapsible(False)
+        self.main_splitter.setHandleWidth(7)
+        main_layout.addWidget(self.main_splitter)
 
         self.table_viewer = TableViewer(
             precision=precision,
@@ -1222,9 +1229,9 @@ class App(QWidget):
             default_max_dev=legacy_max_dev
         )
 
-        self.table_viewer.setMinimumWidth(1100)
-        self.table_viewer.setSizePolicy(QSizePolicy.Preferred, QSizePolicy.Expanding)
-        main_layout.addWidget(self.table_viewer)
+        self.table_viewer.setMinimumWidth(200)
+        self.table_viewer.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        self.main_splitter.addWidget(self.table_viewer)
 
         self.non_table_display = QScrollArea()
         self.non_table_display.setWidgetResizable(True)
@@ -1237,7 +1244,8 @@ class App(QWidget):
 
         self.non_table_display.setWidget(self.non_table_content)
 
-        main_layout.addWidget(self.non_table_display)
+        self.non_table_display.setMinimumWidth(200)
+        self.main_splitter.addWidget(self.non_table_display)
 
         cmd_input = QLineEdit()
         cmd_btn = QPushButton("Send")
@@ -1276,15 +1284,19 @@ class App(QWidget):
 
         cmd_panel = QWidget()
         cmd_panel.setLayout(cmd_layout)
-        cmd_panel.setFixedWidth(300)
+        cmd_panel.setMinimumWidth(180)
+        cmd_panel.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
 
         self.cmd_input = cmd_input
         self.cmd_btn = cmd_btn
 
-        main_layout.addWidget(cmd_panel)
+        self.main_splitter.addWidget(cmd_panel)
 
-        main_layout.setStretchFactor(self.table_viewer, 1)
-        main_layout.setStretchFactor(self.non_table_display, 2)
+        # Initial proportions. The user can freely change them by dragging.
+        self.main_splitter.setStretchFactor(0, 3)
+        self.main_splitter.setStretchFactor(1, 2)
+        self.main_splitter.setStretchFactor(2, 1)
+        self.main_splitter.setSizes([600, 400, 250])
 
         self.worker = SerialWorker(
             port=port,
