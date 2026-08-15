@@ -1,5 +1,5 @@
 COM: "COM3"         # or "/dev/ttyUSB0"
-BAUD: 115200        # optional; defaults to 500000
+BAUD: 460800        # optional; defaults to 500000
 precision: 3     # max digits after the dot for floats in tables
 log_format: "mcap" # fill with csv if you dont have mcap support 
 heatmaps:

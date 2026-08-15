@@ -6,8 +6,6 @@ import os
 import re
 import threading
 import logging
-import queue
-import base64
 from datetime import datetime
 
 import serial
@@ -31,7 +29,7 @@ from PyQt5.QtWidgets import (
 )
 from PyQt5.QtWidgets import QAbstractScrollArea
 from PyQt5.QtGui import QColor
-from PyQt5.QtCore import Qt, QObject, QThread, QTimer, pyqtSignal
+from PyQt5.QtCore import Qt, QObject, QThread, pyqtSignal
 
 
 # ---------------------------------------------------------------------
@@ -88,7 +86,7 @@ class SerialDataLogger:
         mcap_topic_field=None
     ):
         self.log_dir = log_dir or "logs"
-        self.log_format = str(log_format or "jsonl").lower().strip()
+        self.log_format = str(log_format or "csv").lower().strip()
         self.prefix = prefix or "serial_log"
 
         self.mcap_topic_prefix = self._clean_topic_prefix(mcap_topic_prefix)
@@ -107,8 +105,6 @@ class SerialDataLogger:
 
         self.mcap_file = None
         self.mcap_writer = None
-        self.jsonl_file = None
-        self.invalid_file = None
 
         # topic -> channel_id
         self.mcap_channels = {}
@@ -116,28 +112,12 @@ class SerialDataLogger:
         # topic -> schema_id
         self.mcap_schemas = {}
 
-        # Active MCAP schema signature per topic. MCAP schemas/channels are
-        # immutable after registration, so if a topic's JSON structure changes
-        # we rotate to a fresh MCAP file before writing that changed frame.
-        self.mcap_schema_signatures = {}
-        self._mcap_start_stamp = start_stamp
-        self._mcap_part_index = 0
-        self.mcap_paths = []
-
-        opened_mcap = False
-
-        if self.log_format == "jsonl":
-            self._open_jsonl(start_stamp)
-            logger.info("JSONL serial log file: %s", self.path)
-        elif self.log_format == "csv":
-            self._open_csv(start_stamp)
-            logger.info("CSV serial log file: %s", self.path)
-        elif self.log_format == "mcap":
+        if self.log_format == "mcap":
             if MCAP_AVAILABLE:
                 try:
                     self._open_mcap(start_stamp)
                     logger.info("MCAP serial log file: %s", self.path)
-                    opened_mcap = True
+                    return
                 except Exception as e:
                     logger.error("Could not start MCAP logging: %s", e)
                     logger.warning("Falling back to CSV logging.")
@@ -145,43 +125,13 @@ class SerialDataLogger:
                 logger.warning("MCAP package not installed. Falling back to CSV.")
                 logger.warning("Install with: pip install mcap")
 
-        if self.log_format == "mcap" and not opened_mcap:
-            self.log_format = "csv"
-            self._open_csv(start_stamp)
-            logger.info("CSV serial log file: %s", self.path)
-
-        # Invalid/corrupted candidates are captured separately, byte-for-byte
-        # (base64) so serial corruption can be diagnosed without blocking RX.
-        self.invalid_path = os.path.join(
-            self.log_dir, f"{self.prefix}_{start_stamp}_invalid.jsonl"
-        )
-        self.invalid_file = open(self.invalid_path, "w", encoding="utf-8")
-
-        # Logging is intentionally asynchronous. The serial receive thread only
-        # enqueues parsed frames; this writer thread persists every queued frame
-        # in FIFO order without blocking UART reception. The queue is unbounded
-        # on purpose: frames are never dropped merely because disk I/O is slow.
-        self._log_queue = queue.Queue()
-        self._log_sentinel = object()
-        self._flush_interval = 0.25
-        self._frames_enqueued = 0
-        self._frames_written = 0
-        self._writer_error = None
-        self._log_thread = threading.Thread(
-            target=self._writer_loop,
-            name="serial-data-logger",
-            daemon=False
-        )
-        self._log_thread.start()
+        self.log_format = "csv"
+        self._open_csv(start_stamp)
+        logger.info("CSV serial log file: %s", self.path)
 
     # ------------------------------------------------------------
     # File opening
     # ------------------------------------------------------------
-
-    def _open_jsonl(self, start_stamp):
-        self.path = os.path.join(self.log_dir, f"{self.prefix}_{start_stamp}.jsonl")
-        # Large user-space buffering: one write per frame, no flattening.
-        self.jsonl_file = open(self.path, "w", encoding="utf-8", buffering=1024 * 1024)
 
     def _open_csv(self, start_stamp):
         self.path = os.path.join(self.log_dir, f"{self.prefix}_{start_stamp}.csv")
@@ -202,18 +152,8 @@ class SerialDataLogger:
 
         self.csv_file.flush()
 
-    def _open_mcap(self, start_stamp, part_index=0):
-        self._mcap_start_stamp = start_stamp
-        self._mcap_part_index = int(part_index)
-
-        if self._mcap_part_index == 0:
-            filename = f"{self.prefix}_{start_stamp}.mcap"
-        else:
-            filename = (
-                f"{self.prefix}_{start_stamp}_format_{self._mcap_part_index:03d}.mcap"
-            )
-
-        self.path = os.path.join(self.log_dir, filename)
+    def _open_mcap(self, start_stamp):
+        self.path = os.path.join(self.log_dir, f"{self.prefix}_{start_stamp}.mcap")
 
         self.mcap_file = open(self.path, "wb")
         self.mcap_writer = McapWriter(self.mcap_file)
@@ -225,45 +165,6 @@ class SerialDataLogger:
 
         self.mcap_channels = {}
         self.mcap_schemas = {}
-        self.mcap_schema_signatures = {}
-        self.mcap_paths.append(self.path)
-
-    def _finish_current_mcap(self):
-        """Finish and close the currently active MCAP part, if any."""
-        writer = self.mcap_writer
-        file_obj = self.mcap_file
-
-        self.mcap_writer = None
-        self.mcap_file = None
-
-        if writer is not None:
-            try:
-                writer.finish()
-            except Exception as e:
-                logger.warning("Error finishing MCAP part: %s", e)
-
-        if file_obj is not None:
-            try:
-                file_obj.flush()
-            except Exception:
-                pass
-            try:
-                file_obj.close()
-            except Exception:
-                pass
-
-    def _rotate_mcap_for_schema_change(self, topic, old_signature, new_signature):
-        """Start a fresh Foxglove/MCAP file before a changed schema is written."""
-        old_path = self.path
-        self._finish_current_mcap()
-
-        next_index = self._mcap_part_index + 1
-        self._open_mcap(self._mcap_start_stamp, part_index=next_index)
-
-        logger.warning(
-            "MCAP schema changed for topic %s; closed %s and started %s",
-            topic, old_path, self.path
-        )
 
     # ------------------------------------------------------------
     # MCAP topic and schema helpers
@@ -352,16 +253,15 @@ class SerialDataLogger:
 
     def _json_type_for_value(self, value):
         """
-        Convert Python values to a Foxglove-friendly JSON schema.
-
-        Integers and floats are intentionally normalized to JSON "number" so
-        ordinary telemetry changes such as 0 -> 0.25 do not cause needless
-        MCAP file rotation.
+        Convert Python value type to JSON schema type.
         """
         if isinstance(value, bool):
             return {"type": "boolean"}
 
-        if isinstance(value, (int, float)) and not isinstance(value, bool):
+        if isinstance(value, int) and not isinstance(value, bool):
+            return {"type": "integer"}
+
+        if isinstance(value, float):
             return {"type": "number"}
 
         if isinstance(value, str):
@@ -374,12 +274,9 @@ class SerialDataLogger:
             if not value:
                 return {
                     "type": "array",
-                    "items": {}
+                    "items": {"type": "string"}
                 }
 
-            # Most telemetry arrays are homogeneous. Use the first item for the
-            # schema, matching the original behavior, while the full outer shape
-            # is still represented recursively for nested arrays/objects.
             return {
                 "type": "array",
                 "items": self._json_type_for_value(value[0])
@@ -398,13 +295,6 @@ class SerialDataLogger:
             }
 
         return {"type": "string"}
-
-    def _mcap_schema_signature(self, topic, data):
-        """Return a deterministic signature of the schema, not the values."""
-        _name, schema = self._schema_from_json(topic, data)
-        schema = dict(schema)
-        schema.pop("title", None)
-        return json.dumps(schema, sort_keys=True, separators=(",", ":"))
 
     def _schema_from_json(self, topic, data):
         """
@@ -430,20 +320,12 @@ class SerialDataLogger:
 
     def _get_mcap_channel(self, topic, data):
         """
-        Return a channel compatible with the current JSON structure.
+        Create one MCAP channel per dynamic topic.
 
-        If an existing topic changes schema, finish the current MCAP file and
-        open a new one before registering/writing the changed message. This
-        keeps every Foxglove file internally schema-consistent.
+        The schema is created from the first message seen for that topic.
+        Later messages with the same type go to the same topic/channel.
         """
         topic = self._clean_topic(topic)
-        signature = self._mcap_schema_signature(topic, data)
-
-        old_signature = self.mcap_schema_signatures.get(topic)
-        if old_signature is not None and old_signature != signature:
-            self._rotate_mcap_for_schema_change(topic, old_signature, signature)
-            # Rotation clears all channels/signatures. The changed message will
-            # now define the schema in the new file.
 
         if topic in self.mcap_channels:
             return self.mcap_channels[topic]
@@ -453,7 +335,7 @@ class SerialDataLogger:
         schema_id = self.mcap_writer.register_schema(
             name=schema_name,
             encoding="jsonschema",
-            data=json.dumps(schema, separators=(",", ":")).encode("utf-8")
+            data=json.dumps(schema).encode("utf-8")
         )
 
         channel_id = self.mcap_writer.register_channel(
@@ -464,12 +346,8 @@ class SerialDataLogger:
 
         self.mcap_schemas[topic] = schema_id
         self.mcap_channels[topic] = channel_id
-        self.mcap_schema_signatures[topic] = signature
 
-        logger.info(
-            "Created MCAP topic %s in %s",
-            topic, os.path.basename(self.path)
-        )
+        logger.info("Created MCAP topic: %s", topic)
 
         return channel_id
 
@@ -489,6 +367,10 @@ class SerialDataLogger:
             data=data
         )
 
+        try:
+            self.mcap_file.flush()
+        except Exception:
+            pass
 
     # ------------------------------------------------------------
     # MCAP payload helpers
@@ -618,247 +500,137 @@ class SerialDataLogger:
             raw_json
         ])
 
-    # ------------------------------------------------------------
-    # Asynchronous logging
-    # ------------------------------------------------------------
-
-    def _flush_files(self):
-        try:
-            if self.jsonl_file:
-                self.jsonl_file.flush()
-        except Exception as e:
-            logger.warning("JSONL flush failed: %s", e)
-
-        try:
-            if self.invalid_file:
-                self.invalid_file.flush()
-        except Exception as e:
-            logger.warning("Invalid-frame log flush failed: %s", e)
-
-        try:
-            if self.csv_file:
-                self.csv_file.flush()
-        except Exception as e:
-            logger.warning("CSV flush failed: %s", e)
-
-        try:
-            if self.mcap_file:
-                self.mcap_file.flush()
-        except Exception as e:
-            logger.warning("MCAP flush failed: %s", e)
-
-    def _write_received_sync(self, timestamp_iso, port, data, raw_json=None):
-        if self.log_format == "jsonl":
-            if raw_json is None:
-                raw_json = json.dumps(data, ensure_ascii=False, separators=(",", ":"))
-            # Preserve the exact received JSON text as one physical line.
-            self.jsonl_file.write(raw_json.rstrip("\r\n") + "\n")
-            self._frames_written += 1
-            return
-
-        if self.log_format == "mcap":
-            topic = self._topic_from_json(data)
-            mcap_payload = self._make_mcap_payload(data)
-            self._write_mcap_json(topic, mcap_payload)
-            self._frames_written += 1
-            return
-
-        if raw_json is None:
-            raw_json = json.dumps(data, ensure_ascii=False)
-
-        flattened = self._flatten_json(data)
-        if not flattened:
-            flattened = [("", "")]
-
-        # Keep the existing flattened CSV format, but avoid duplicating the
-        # complete ~5 KB JSON string into every flattened row. The exact raw
-        # frame is stored on the first row only; all values are still logged.
-        rows = []
-        for index, (path, value) in enumerate(flattened):
-            value_text, value_number, is_numeric = self._value_parts(value)
-            rows.append([
-                timestamp_iso,
-                "receive",
-                port,
-                path,
-                value_text,
-                value_number,
-                is_numeric,
-                raw_json if index == 0 else ""
-            ])
-
-        self.csv_writer.writerows(rows)
-        self._frames_written += 1
-
-    def _write_send_sync(self, timestamp_iso, port, command, error=None):
-        direction = "send_failed" if error is not None else "send"
-        payload = {
-            "timestamp_iso": timestamp_iso,
-            "direction": direction,
-            "port": port,
-            "command": command
-        }
-        if error is not None:
-            payload["error"] = str(error)
-
-        if self.log_format == "jsonl":
-            # Commands share the same append-only journal as received JSON.
-            self.jsonl_file.write(json.dumps(payload, ensure_ascii=False, separators=(",", ":")) + "\n")
-            return
-
-        if self.log_format == "mcap":
-            topic = "/serial/commands_failed" if error is not None else "/serial/commands"
-            self._write_mcap_json(topic, payload)
-            return
-
-        raw_json = json.dumps(payload, ensure_ascii=False)
-        value_text, value_number, is_numeric = self._value_parts(command)
-        self._write_csv_row(
-            timestamp_iso, direction, port, "command",
-            value_text, value_number, is_numeric, raw_json
-        )
-
-    def _writer_loop(self):
-        last_flush = time.monotonic()
-
-        while True:
-            try:
-                item = self._log_queue.get(timeout=self._flush_interval)
-            except queue.Empty:
-                self._flush_files()
-                last_flush = time.monotonic()
-                continue
-
-            try:
-                if item is self._log_sentinel:
-                    self._flush_files()
-                    return
-
-                kind = item[0]
-
-                if kind == "receive":
-                    _, timestamp_iso, port, data, raw_json = item
-                    self._write_received_sync(timestamp_iso, port, data, raw_json)
-
-                elif kind == "send":
-                    _, timestamp_iso, port, command = item
-                    self._write_send_sync(timestamp_iso, port, command)
-
-                elif kind == "send_failed":
-                    _, timestamp_iso, port, command, error = item
-                    self._write_send_sync(timestamp_iso, port, command, error=error)
-
-                elif kind == "invalid":
-                    _, timestamp_iso, port, raw_bytes, error = item
-                    record = {
-                        "timestamp_iso": timestamp_iso,
-                        "port": port,
-                        "error": str(error),
-                        "length": len(raw_bytes),
-                        "raw_base64": base64.b64encode(raw_bytes).decode("ascii")
-                    }
-                    self.invalid_file.write(
-                        json.dumps(record, separators=(",", ":")) + "\n"
-                    )
-
-            except Exception as e:
-                self._writer_error = e
-                logger.exception("Serial data logger write failed: %s", e)
-
-            finally:
-                self._log_queue.task_done()
-
-            now = time.monotonic()
-            if now - last_flush >= self._flush_interval:
-                self._flush_files()
-                last_flush = now
+        self.csv_file.flush()
 
     # ------------------------------------------------------------
     # Public logging methods
     # ------------------------------------------------------------
 
-    def log_received(self, port, data, raw_json=None):
+    def log_received(self, port, data):
         timestamp_iso = datetime.now().isoformat(timespec="milliseconds")
+        raw_json = json.dumps(data, ensure_ascii=False)
 
         with self.lock:
             if self.closed:
-                return False
+                return
 
-            self._frames_enqueued += 1
-            self._log_queue.put(("receive", timestamp_iso, port, data, raw_json))
+            if self.log_format == "mcap":
+                topic = self._topic_from_json(data)
+                mcap_payload = self._make_mcap_payload(data)
+                self._write_mcap_json(topic, mcap_payload)
+                return
 
-        return True
+            # CSV stays flattened exactly like before.
+            flattened = self._flatten_json(data)
+
+            if not flattened:
+                flattened = [("", "")]
+
+            for path, value in flattened:
+                value_text, value_number, is_numeric = self._value_parts(value)
+
+                self._write_csv_row(
+                    timestamp_iso,
+                    "receive",
+                    port,
+                    path,
+                    value_text,
+                    value_number,
+                    is_numeric,
+                    raw_json
+                )
 
     def log_send(self, port, command):
         timestamp_iso = datetime.now().isoformat(timespec="milliseconds")
 
+        payload = {
+            "timestamp_iso": timestamp_iso,
+            "direction": "send",
+            "port": port,
+            "command": command
+        }
+
+        raw_json = json.dumps(payload, ensure_ascii=False)
+        value_text, value_number, is_numeric = self._value_parts(command)
+
         with self.lock:
             if self.closed:
-                return False
-            self._log_queue.put(("send", timestamp_iso, port, command))
+                return
 
-        return True
+            if self.log_format == "mcap":
+                self._write_mcap_json("/serial/commands", payload)
+                return
+
+            self._write_csv_row(
+                timestamp_iso,
+                "send",
+                port,
+                "command",
+                value_text,
+                value_number,
+                is_numeric,
+                raw_json
+            )
 
     def log_send_failed(self, port, command, error):
         timestamp_iso = datetime.now().isoformat(timespec="milliseconds")
 
+        payload = {
+            "timestamp_iso": timestamp_iso,
+            "direction": "send_failed",
+            "port": port,
+            "command": command,
+            "error": str(error)
+        }
+
+        raw_json = json.dumps(payload, ensure_ascii=False)
+        value_text, value_number, is_numeric = self._value_parts(command)
+
         with self.lock:
             if self.closed:
-                return False
-            self._log_queue.put(("send_failed", timestamp_iso, port, command, str(error)))
+                return
 
-        return True
+            if self.log_format == "mcap":
+                self._write_mcap_json("/serial/commands_failed", payload)
+                return
 
-    def log_invalid_frame(self, port, raw_bytes, error):
-        timestamp_iso = datetime.now().isoformat(timespec="milliseconds")
-        raw_bytes = bytes(raw_bytes)
-        with self.lock:
-            if self.closed:
-                return False
-            self._log_queue.put(("invalid", timestamp_iso, port, raw_bytes, str(error)))
-        return True
+            self._write_csv_row(
+                timestamp_iso,
+                "send_failed",
+                port,
+                "command",
+                value_text,
+                value_number,
+                is_numeric,
+                raw_json
+            )
 
     def close(self):
         with self.lock:
             if self.closed:
                 return
+
             self.closed = True
-            self._log_queue.put(self._log_sentinel)
 
-        # FIFO ordering means the sentinel is processed only after every frame
-        # queued before close(). Do not use a short timeout here: closing the
-        # application should drain the logger rather than silently lose frames.
-        try:
-            self._log_thread.join()
-        except Exception as e:
-            logger.warning("Error waiting for serial logger thread: %s", e)
+            try:
+                if self.mcap_writer:
+                    self.mcap_writer.finish()
+            except Exception as e:
+                logger.warning("Error finishing MCAP log: %s", e)
 
-        if self.log_format == "mcap":
-            self._finish_current_mcap()
+            try:
+                if self.mcap_file:
+                    self.mcap_file.flush()
+                    self.mcap_file.close()
+            except Exception:
+                pass
 
-        self._flush_files()
-
-        try:
-            if self.csv_file:
-                self.csv_file.close()
-        except Exception:
-            pass
-
-        logger.info(
-            "Serial logger closed: %d/%d received JSON frames written",
-            self._frames_written,
-            self._frames_enqueued
-        )
-
-        if self.log_format == "mcap" and self.mcap_paths:
-            logger.info(
-                "MCAP output used %d schema-consistent file(s): %s",
-                len(self.mcap_paths),
-                ", ".join(os.path.basename(p) for p in self.mcap_paths)
-            )
-
-        if self._writer_error is not None:
-            logger.warning("At least one logger write error occurred: %s", self._writer_error)
+            try:
+                if self.csv_file:
+                    self.csv_file.flush()
+                    self.csv_file.close()
+            except Exception:
+                pass
 
 # ---------------------------------------------------------------------
 # Config
@@ -872,7 +644,7 @@ def load_config(path="config.yaml"):
         "precision": 3,
 
         "log_dir": "logs",
-        "log_format": "jsonl",
+        "log_format": "csv",
         "log_prefix": "serial_log",
 
         # MCAP topic settings
@@ -882,11 +654,7 @@ def load_config(path="config.yaml"):
 
         "heatmaps": None,
         "heatmap_tables": None,
-        "max_deviation": 0.05,
-
-        # Strong frame boundary used to recover from missing/spurious newlines.
-        # Set to null in YAML to use newline-only framing.
-        "frame_start_marker": '{"timestamp":'
+        "max_deviation": 0.05
     }
 
     if not path:
@@ -918,10 +686,10 @@ def load_config(path="config.yaml"):
         if "log_format" in data and isinstance(data["log_format"], str):
             fmt = data["log_format"].lower().strip()
 
-            if fmt in ("jsonl", "csv", "mcap"):
+            if fmt in ("csv", "mcap"):
                 cfg["log_format"] = fmt
             else:
-                logger.warning("Invalid log_format in YAML; using jsonl")
+                logger.warning("Invalid log_format in YAML; using csv")
 
         if "log_prefix" in data and isinstance(data["log_prefix"], str) and data["log_prefix"]:
             cfg["log_prefix"] = data["log_prefix"]
@@ -937,14 +705,6 @@ def load_config(path="config.yaml"):
                 cfg["mcap_topic_field"] = None
             else:
                 cfg["mcap_topic_field"] = str(data["mcap_topic_field"]).strip() or None
-
-        if "frame_start_marker" in data:
-            marker = data.get("frame_start_marker")
-            if marker is None:
-                cfg["frame_start_marker"] = None
-            else:
-                marker = str(marker)
-                cfg["frame_start_marker"] = marker if marker else None
 
         if "buttons" in data and isinstance(data["buttons"], list):
             norm = []
@@ -1036,18 +796,12 @@ def load_config(path="config.yaml"):
 class SerialWorker(QObject):
     data_received = pyqtSignal(dict)
 
-    def __init__(self, port="/dev/ttyUSB0", baudrate=500000, data_logger=None, frame_start_marker='{"timestamp":'):
+    def __init__(self, port="/dev/ttyUSB0", baudrate=500000, data_logger=None):
         super().__init__()
 
         self.port = port
         self.baudrate = baudrate
         self.data_logger = data_logger
-        if frame_start_marker is None:
-            self.frame_start_marker = None
-        elif isinstance(frame_start_marker, bytes):
-            self.frame_start_marker = frame_start_marker
-        else:
-            self.frame_start_marker = str(frame_start_marker).encode("utf-8")
 
         self._running = True
         self.serial_port = None
@@ -1072,21 +826,9 @@ class SerialWorker(QObject):
             self.serial_port = serial.Serial(
                 self.port,
                 self.baudrate,
-                timeout=0.05,
-                write_timeout=0.75,
-                xonxoff=False,
-                rtscts=False,
-                dsrdtr=False
+                timeout=0.75,
+                write_timeout=0.75
             )
-
-            # Supported by pyserial on some platforms (notably Windows).
-            # A larger driver RX buffer provides extra margin at 921600 baud.
-            try:
-                set_buffer_size = getattr(self.serial_port, "set_buffer_size", None)
-                if set_buffer_size:
-                    set_buffer_size(rx_size=1024 * 1024, tx_size=64 * 1024)
-            except Exception as e:
-                logger.debug("Could not enlarge serial driver buffers: %s", e)
 
             logger.info("Opened serial %s @ %s", self.port, self.baudrate)
 
@@ -1099,126 +841,27 @@ class SerialWorker(QObject):
 
             time.sleep(0.1)
 
-    def _parse_candidate(self, raw_frame, report_error=True):
-        raw_frame = bytes(raw_frame).strip(b" \t\r\n")
-        if not raw_frame:
-            return False
-
-        try:
-            text = raw_frame.decode("utf-8")
-            json_data = json.loads(text)
-        except (UnicodeDecodeError, json.JSONDecodeError) as e:
-            if report_error:
-                pos = getattr(e, "pos", -1)
-                logger.warning(
-                    "Invalid JSON serial frame (%d bytes, error at %s: %s). "
-                    "Start=%r End=%r",
-                    len(raw_frame), pos, e, raw_frame[:80], raw_frame[-80:]
-                )
-                if self.data_logger:
-                    self.data_logger.log_invalid_frame(self.port, raw_frame, e)
-            return False
-
-        if self.data_logger:
-            self.data_logger.log_received(self.port, json_data, raw_json=text)
-        self.data_received.emit(json_data)
-        return True
-
-    @staticmethod
-    def _partial_marker_suffix_length(buffer, marker):
-        max_len = min(len(buffer), max(0, len(marker) - 1))
-        for n in range(max_len, 0, -1):
-            if buffer[-n:] == marker[:n]:
-                return n
-        return 0
-
-    def _drain_marker_frames(self, rx_buffer):
-        """
-        Frame using the start of the next JSON object, not only newline.
-
-        This is deliberately stronger than newline framing for the telemetry
-        stream: if one CR/LF is inserted or lost, the next '{"timestamp":'
-        still provides an unambiguous resynchronization point. A complete
-        current frame may still be accepted immediately when a newline-delimited
-        prefix parses successfully.
-        """
-        marker = self.frame_start_marker
-
-        while True:
-            first = rx_buffer.find(marker)
-            if first < 0:
-                # Keep only a possible partial marker at the end. Old noise can
-                # never become a valid frame and should not grow without bound.
-                keep = self._partial_marker_suffix_length(rx_buffer, marker)
-                if len(rx_buffer) > max(4096, len(marker) * 4):
-                    noise_len = len(rx_buffer) - keep
-                    if noise_len > 0:
-                        logger.warning(
-                            "Discarding %d serial bytes while searching for frame marker %r",
-                            noise_len, marker
-                        )
-                        del rx_buffer[:noise_len]
-                return
-
-            if first > 0:
-                noise = bytes(rx_buffer[:first])
-                if noise.strip(b" \t\r\n"):
-                    logger.warning(
-                        "Resynchronizing serial stream: discarded %d bytes before %r",
-                        first, marker
-                    )
-                del rx_buffer[:first]
-
-            # A second marker conclusively ends the current candidate, even if
-            # the sender lost the newline between frames.
-            next_start = rx_buffer.find(marker, len(marker))
-            if next_start >= 0:
-                candidate = bytes(rx_buffer[:next_start])
-                del rx_buffer[:next_start]
-                self._parse_candidate(candidate, report_error=True)
-                continue
-
-            # No next frame yet. Try every newline currently present. If an
-            # early newline is spurious, parsing fails silently and we keep the
-            # bytes until a later newline or the next start marker arrives.
-            search_from = len(marker)
-            while True:
-                newline = rx_buffer.find(b"\n", search_from)
-                if newline < 0:
-                    return
-                candidate = bytes(rx_buffer[:newline])
-                if self._parse_candidate(candidate, report_error=False):
-                    del rx_buffer[:newline + 1]
-                    break
-                search_from = newline + 1
-            # Successfully consumed one complete newline-delimited frame; loop
-            # again because more bytes may already be buffered.
-
-    def _drain_newline_frames(self, rx_buffer):
-        while True:
-            newline = rx_buffer.find(b"\n")
-            if newline < 0:
-                return
-            candidate = bytes(rx_buffer[:newline])
-            del rx_buffer[:newline + 1]
-            self._parse_candidate(candidate, report_error=True)
-
     def start(self):
-        rx_buffer = bytearray()
-        max_rx_buffer = 1024 * 1024
-        bytes_read = 0
-        last_stats = time.monotonic()
+        buffer = ""
 
         while self._running:
             if self.serial_port is None or not self.serial_port.is_open:
                 try:
                     self._open_port()
-                    rx_buffer.clear()
-                except (serial.SerialException, OSError) as e:
+                    buffer = ""
+
+                except serial.SerialException as e:
                     logger.error("Could not open serial port %s: %s", self.port, e)
                     self._close_port()
                     self._wait_before_reconnect()
                     continue
+
+                except OSError as e:
+                    logger.error("OS error opening serial port %s: %s", self.port, e)
+                    self._close_port()
+                    self._wait_before_reconnect()
+                    continue
+
                 except Exception as e:
                     logger.error("Unexpected error opening serial port %s: %s", self.port, e)
                     self._close_port()
@@ -1227,56 +870,44 @@ class SerialWorker(QObject):
 
             try:
                 with self._lock:
-                    sp = self.serial_port
-                    if sp is None or not sp.is_open:
+                    if self.serial_port is None or not self.serial_port.is_open:
                         continue
-                    waiting = sp.in_waiting
-                    read_size = min(max(waiting, 1), 65536)
-                    chunk = sp.read(read_size)
 
-                if not chunk:
+                    line = self.serial_port.readline().decode(
+                        "utf-8",
+                        errors="ignore"
+                    )
+
+                if not line:
                     continue
 
-                bytes_read += len(chunk)
-                rx_buffer.extend(chunk)
+                buffer = line.strip()
 
-                if self.frame_start_marker:
-                    self._drain_marker_frames(rx_buffer)
-                else:
-                    self._drain_newline_frames(rx_buffer)
+                try:
+                    json_data = json.loads(buffer)
 
-                if len(rx_buffer) > max_rx_buffer:
-                    logger.error(
-                        "Serial RX buffer exceeded %d bytes; discarding to resynchronize",
-                        max_rx_buffer
-                    )
                     if self.data_logger:
-                        self.data_logger.log_invalid_frame(
-                            self.port, bytes(rx_buffer), "RX buffer overflow/resync"
-                        )
-                    rx_buffer.clear()
+                        self.data_logger.log_received(self.port, json_data)
 
-                now = time.monotonic()
-                if now - last_stats >= 5.0:
-                    qsize = self.data_logger._log_queue.qsize() if self.data_logger else 0
-                    logger.info(
-                        "RX %.1f KiB/s, buffered=%d B, logger_queue=%d",
-                        (bytes_read / 1024.0) / (now - last_stats),
-                        len(rx_buffer), qsize
-                    )
-                    bytes_read = 0
-                    last_stats = now
+                    self.data_received.emit(json_data)
+                    buffer = ""
+
+                except json.JSONDecodeError:
+                    logger.debug("Ignoring non-JSON serial line: %s", buffer)
+                    continue
 
             except serial.SerialException as e:
                 logger.error("Serial port read error: %s", e)
                 self._close_port()
                 self._wait_before_reconnect()
+
             except OSError as e:
                 logger.error("Serial OS read error: %s", e)
                 self._close_port()
                 self._wait_before_reconnect()
+
             except Exception as e:
-                logger.exception("Unexpected serial read error: %s", e)
+                logger.error("Unexpected serial read error: %s", e)
                 self._close_port()
                 self._wait_before_reconnect()
 
@@ -1369,8 +1000,37 @@ class TableViewer(QWidget):
         self.scroll = scroll
         self.content = content
         self.content_layout = content_layout
-        self._table_widgets = {}
-        self._structure_signature = None
+        self.last_rendered = None
+
+    def display_tables(self, data):
+        if data == self.last_rendered:
+            return
+
+        self.clear_layout(self.content_layout)
+        self.render_data(data)
+        self.last_rendered = data
+
+    def render_data(self, data):
+        if isinstance(data, dict):
+            for key, value in data.items():
+                if isinstance(value, list) and self.is_2d_array(value):
+                    self.add_label(key + ":", bold=True)
+
+                    max_dev = None
+
+                    if self.heatmap_rules is None:
+                        max_dev = self.default_max_dev
+                    elif key in self.heatmap_rules:
+                        max_dev = self.heatmap_rules[key]
+
+                    self.add_table(value, max_dev=max_dev)
+
+                elif isinstance(value, (dict, list)):
+                    self.render_data(value)
+
+        elif isinstance(data, list):
+            for item in data:
+                self.render_data(item)
 
     def is_2d_array(self, arr):
         return (
@@ -1380,110 +1040,28 @@ class TableViewer(QWidget):
             and all(len(r) == len(arr[0]) for r in arr)
         )
 
-    def _collect_tables(self, data, prefix=""):
-        found = []
+    def add_label(self, text, bold=False):
+        label = QLabel(text)
+        label.setWordWrap(True)
+        label.setTextInteractionFlags(Qt.TextSelectableByMouse)
 
-        if isinstance(data, dict):
-            for key, value in data.items():
-                path = f"{prefix}.{key}" if prefix else str(key)
+        if bold:
+            label.setStyleSheet("font-weight: bold")
 
-                if isinstance(value, list) and self.is_2d_array(value):
-                    found.append((path, str(key), value))
-                elif isinstance(value, (dict, list)):
-                    found.extend(self._collect_tables(value, path))
-
-        elif isinstance(data, list):
-            for index, value in enumerate(data):
-                path = f"{prefix}[{index}]" if prefix else f"[{index}]"
-                found.extend(self._collect_tables(value, path))
-
-        return found
-
-    def _max_deviation_for(self, name):
-        if self.heatmap_rules is None:
-            return self.default_max_dev
-        return self.heatmap_rules.get(name)
-
-    def display_tables(self, data):
-        found = self._collect_tables(data)
-        signature = tuple(
-            (path, len(values), len(values[0]) if values else 0)
-            for path, _name, values in found
-        )
-
-        self.content.setUpdatesEnabled(False)
-        try:
-            if signature != self._structure_signature:
-                self.clear_layout(self.content_layout)
-                self._table_widgets.clear()
-
-                for path, name, values in found:
-                    label = QLabel(name + ":")
-                    label.setWordWrap(True)
-                    label.setTextInteractionFlags(Qt.TextSelectableByMouse)
-                    label.setStyleSheet("font-weight: bold")
-                    self.content_layout.addWidget(label)
-
-                    table = self._create_table(values)
-                    self.content_layout.addWidget(table)
-                    self._table_widgets[path] = (
-                        table, self._max_deviation_for(name)
-                    )
-
-                self._structure_signature = signature
-
-            for path, _name, values in found:
-                table, max_dev = self._table_widgets[path]
-                self._update_table(table, values, max_dev=max_dev)
-
-        finally:
-            self.content.setUpdatesEnabled(True)
-            self.content.update()
-
-    def _create_table(self, table_data):
-        rows, cols = len(table_data), len(table_data[0])
-        table = QTableWidget(rows, cols)
-        table.setVerticalHeaderLabels([str(i + 1) for i in range(rows)])
-        table.verticalHeader().setVisible(True)
-        table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeToContents)
-        table.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-        table.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
-        table.setSizeAdjustPolicy(QAbstractScrollArea.AdjustToContents)
-        table.setEditTriggers(QTableWidget.NoEditTriggers)
-        table.setFocusPolicy(Qt.NoFocus)
-        table.setStyleSheet("QTableWidget { border: 1px solid #ccc; }")
-
-        for i in range(rows):
-            for j in range(cols):
-                table.setItem(i, j, QTableWidgetItem(""))
-
-        self._update_table(table, table_data, max_dev=None)
-        table.resizeColumnsToContents()
-
-        # Resize once, then keep column geometry stable. ResizeToContents on a
-        # live table causes costly width recalculation after almost every setText.
-        header = table.horizontalHeader()
-        widths = [table.columnWidth(i) for i in range(cols)]
-        header.setSectionResizeMode(QHeaderView.Fixed)
-        for i, width in enumerate(widths):
-            table.setColumnWidth(i, width)
-
-        height = (
-            sum(table.rowHeight(i) for i in range(rows))
-            + table.horizontalHeader().height()
-        )
-        table.setFixedHeight(height)
-        return table
+        self.content_layout.addWidget(label)
 
     def _format_for_display(self, val):
         try:
             num = float(val)
             s = f"{num:.{self.precision}f}"
+
             if self.precision > 0:
                 s = s.rstrip("0").rstrip(".")
             else:
                 s = s.split(".")[0]
+
             return s
+
         except Exception:
             return str(val)
 
@@ -1496,96 +1074,104 @@ class TableViewer(QWidget):
         return QColor(int(r), int(g), int(b))
 
     def _green_color(self, t):
-        return self._qcolor_from_rgb(
-            self._lerp(234, 184, t),
-            self._lerp(251, 240, t),
-            self._lerp(234, 184, t)
-        )
+        r = self._lerp(234, 184, t)
+        g = self._lerp(251, 240, t)
+        b = self._lerp(234, 184, t)
+        return self._qcolor_from_rgb(r, g, b)
 
     def _red_color(self, t):
-        return self._qcolor_from_rgb(
-            self._lerp(255, 255, t),
-            self._lerp(234, 140, t),
-            self._lerp(234, 140, t)
-        )
+        r = self._lerp(255, 255, t)
+        g = self._lerp(234, 140, t)
+        b = self._lerp(234, 140, t)
+        return self._qcolor_from_rgb(r, g, b)
 
     def _violet_color(self, t):
-        return self._qcolor_from_rgb(
-            self._lerp(230, 173, t),
-            self._lerp(245, 216, t),
-            self._lerp(255, 255, t)
-        )
+        r = self._lerp(255, 255, t)
+        g = self._lerp(234, 140, t)
+        b = self._lerp(234, 240, t)
+        return self._qcolor_from_rgb(r, g, b)
 
-    def _update_table(self, table, table_data, max_dev=None):
+    def add_table(self, table_data, max_dev=None):
+        rows, cols = len(table_data), len(table_data[0])
+
         nums = []
-        for row in table_data:
-            for value in row:
+
+        for r in table_data:
+            for v in r:
                 try:
-                    nums.append(float(value))
+                    nums.append(float(v))
                 except Exception:
                     pass
 
         avg = sum(nums) / len(nums) if nums else 0.0
+
+        table = QTableWidget(rows, cols)
+        table.setVerticalHeaderLabels([str(i + 1) for i in range(rows)])
+        table.verticalHeader().setVisible(True)
+        table.horizontalHeader().setSectionResizeMode(QHeaderView.ResizeToContents)
+        table.setVerticalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        table.setHorizontalScrollBarPolicy(Qt.ScrollBarAlwaysOff)
+        table.setSizeAdjustPolicy(QAbstractScrollArea.AdjustToContents)
+
         red_cap_factor = 5.0
 
-        for i, row in enumerate(table_data):
-            for j, raw_val in enumerate(row):
-                item = table.item(i, j)
-                if item is None:
-                    item = QTableWidgetItem()
-                    table.setItem(i, j, item)
-
+        for i in range(rows):
+            for j in range(cols):
+                raw_val = table_data[i][j]
                 display_text = self._format_for_display(raw_val)
-                if item.text() != display_text:
-                    item.setText(display_text)
 
-                # Calculate the desired heatmap color, but only touch Qt's
-                # background role when the resulting color actually changes.
-                # This avoids hundreds of redundant repaints per frame.
-                background_key = None
-                background_color = None
+                item = QTableWidgetItem(display_text)
 
-                if max_dev is not None and max_dev > 0 and avg != 0:
+                if max_dev is not None and avg != 0:
                     try:
                         num = float(raw_val)
-                        relative = (num - avg) / abs(avg)
-                        diff_abs = abs(relative)
 
-                        if diff_abs <= max_dev:
-                            t = 1.0 - (diff_abs / max_dev)
-                            background_color = self._green_color(t)
+                        diff_abs = abs(num - avg) / abs(avg)
+                        diff = num - avg
+
+                        if diff <= max_dev:
+                            t = (diff_abs / max_dev) * -1 + 1
+                            color = self._green_color(t)
+                            item.setBackground(color)
+
+                        elif diff > max_dev:
+                            over = diff_abs - max_dev
+                            denom = max(max_dev * red_cap_factor, 1e-12)
+                            t = max(0.0, min(1.0, over / denom))
+                            color = self._red_color(t)
+                            item.setBackground(color)
+
                         else:
                             over = diff_abs - max_dev
                             denom = max(max_dev * red_cap_factor, 1e-12)
                             t = max(0.0, min(1.0, over / denom))
-                            if relative > 0:
-                                background_color = self._red_color(t)
-                            else:
-                                background_color = self._violet_color(t)
+                            color = self._violet_color(t)
+                            item.setBackground(color)
 
-                        background_key = (
-                            background_color.red(),
-                            background_color.green(),
-                            background_color.blue()
-                        )
                     except Exception:
-                        background_key = None
-                        background_color = None
+                        pass
 
-                old_key = item.data(Qt.UserRole)
-                if old_key != background_key:
-                    item.setData(Qt.UserRole, background_key)
-                    if background_color is None:
-                        item.setData(Qt.BackgroundRole, None)
-                    else:
-                        item.setBackground(background_color)
+                table.setItem(i, j, item)
+
+        table.resizeColumnsToContents()
+
+        height = (
+            sum(table.rowHeight(i) for i in range(rows))
+            + table.horizontalHeader().height()
+        )
+
+        table.setFixedHeight(height)
+        table.setStyleSheet("QTableWidget { border: 1px solid #ccc; }")
+
+        self.content_layout.addWidget(table)
 
     def clear_layout(self, layout):
         while layout.count():
             item = layout.takeAt(0)
-            widget = item.widget()
-            if widget:
-                widget.deleteLater()
+            w = item.widget()
+
+            if w:
+                w.setParent(None)
 
 
 # ---------------------------------------------------------------------
@@ -1602,8 +1188,7 @@ class App(QWidget):
         heatmaps=None,
         legacy_tables=None,
         legacy_max_dev=0.05,
-        data_logger=None,
-        frame_start_marker='{"timestamp":'
+        data_logger=None
     ):
         super().__init__()
 
@@ -1611,10 +1196,6 @@ class App(QWidget):
         self.setMinimumSize(1200, 600)
 
         self.data_logger = data_logger
-        self.latest_data = None
-        self._refresh_pending = False
-        self._non_table_keys = None
-        self._non_table_widgets = []
 
         rules = None
 
@@ -1720,8 +1301,7 @@ class App(QWidget):
         self.worker = SerialWorker(
             port=port,
             baudrate=baudrate,
-            data_logger=self.data_logger,
-            frame_start_marker=frame_start_marker
+            data_logger=self.data_logger
         )
 
         self.thread = QThread()
@@ -1731,9 +1311,6 @@ class App(QWidget):
         self.thread.started.connect(self.worker.start)
         self.thread.start()
 
-        # No fixed GUI refresh rate. Incoming data schedules one zero-delay
-        # refresh through the Qt event loop. Bursts are coalesced to the newest
-        # frame so serial/logging stay lossless while the GUI remains interactive.
         self.build_quick_buttons(buttons or [])
 
     def build_quick_buttons(self, buttons):
@@ -1792,84 +1369,48 @@ class App(QWidget):
             self.cmd_input.clear()
 
     def update_view(self, data):
-        # Keep the newest display sample. Logging is handled independently in the
-        # serial/logger threads and still receives every valid JSON frame.
-        self.latest_data = data
-
-        # Schedule at most one refresh. QTimer.singleShot(0, ...) lets Qt process
-        # mouse/keyboard/scroll/paint events between redraws instead of imposing
-        # a fixed 10 Hz gate or creating an unbounded redraw queue.
-        if not self._refresh_pending:
-            self._refresh_pending = True
-            QTimer.singleShot(0, self.refresh_view)
-
-    def refresh_view(self):
-        self._refresh_pending = False
-
-        if self.latest_data is None:
-            return
-
-        data = self.latest_data
-        self.latest_data = None
-
-        # Child widgets already suppress their own repaint while values change.
-        # Avoid disabling updates for the entire top-level window because that
-        # can make splitter dragging, scrolling and button feedback feel sticky.
         self.table_viewer.display_tables(data)
         self.render_non_table(data)
 
     def render_non_table(self, data):
-        entries = []
+        while self.non_table_layout.count():
+            w = self.non_table_layout.takeAt(0).widget()
 
-        if isinstance(data, dict):
-            for key, value in data.items():
-                if isinstance(value, list) and self.table_viewer.is_2d_array(value):
-                    continue
-                entries.append((str(key), str(value)))
-        elif isinstance(data, list):
-            entries.append(("value", str(data)))
-        else:
-            entries.append(("value", str(data)))
+            if w:
+                w.setParent(None)
 
-        keys = tuple(key for key, _value in entries)
+        def add_wrapping_label(text, bold=False, indent=0):
+            lbl = QLabel(text)
 
-        self.non_table_content.setUpdatesEnabled(False)
-        try:
-            if keys != self._non_table_keys:
-                while self.non_table_layout.count():
-                    item = self.non_table_layout.takeAt(0)
-                    widget = item.widget()
-                    if widget:
-                        widget.deleteLater()
+            if bold:
+                lbl.setStyleSheet("font-weight:bold;")
 
-                self._non_table_widgets = []
+            if indent:
+                lbl.setIndent(indent)
 
-                for key, _value in entries:
-                    key_label = QLabel(key + ":")
-                    key_label.setStyleSheet("font-weight:bold;")
-                    key_label.setWordWrap(True)
-                    key_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
-                    key_label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Maximum)
+            lbl.setWordWrap(True)
+            lbl.setTextInteractionFlags(Qt.TextSelectableByMouse)
+            lbl.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Maximum)
 
-                    value_label = QLabel("")
-                    value_label.setIndent(10)
-                    value_label.setWordWrap(True)
-                    value_label.setTextInteractionFlags(Qt.TextSelectableByMouse)
-                    value_label.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Maximum)
+            self.non_table_layout.addWidget(lbl)
 
-                    self.non_table_layout.addWidget(key_label)
-                    self.non_table_layout.addWidget(value_label)
-                    self._non_table_widgets.append(value_label)
+        def recurse(d):
+            if isinstance(d, dict):
+                for k, v in d.items():
+                    if isinstance(v, list) and self.table_viewer.is_2d_array(v):
+                        continue
 
-                self._non_table_keys = keys
+                    add_wrapping_label(f"{k}:", bold=True)
+                    add_wrapping_label(str(v), indent=10)
 
-            for value_label, (_key, value) in zip(self._non_table_widgets, entries):
-                if value_label.text() != value:
-                    value_label.setText(value)
+            elif isinstance(d, list):
+                for item in d:
+                    recurse(item)
 
-        finally:
-            self.non_table_content.setUpdatesEnabled(True)
-            self.non_table_content.update()
+            else:
+                add_wrapping_label(str(d))
+
+        recurse(data)
 
     def closeEvent(self, event):
         try:
@@ -1906,7 +1447,7 @@ if __name__ == "__main__":
 
     serial_logger = SerialDataLogger(
         log_dir=cfg.get("log_dir", "logs"),
-        log_format=cfg.get("log_format", "jsonl"),
+        log_format=cfg.get("log_format", "csv"),
         prefix=cfg.get("log_prefix", "serial_log"),
         mcap_topic_prefix=cfg.get("mcap_topic_prefix", "/serial"),
         mcap_default_topic=cfg.get("mcap_default_topic", "/serial/json"),
@@ -1923,8 +1464,7 @@ if __name__ == "__main__":
         heatmaps=heatmaps,
         legacy_tables=legacy_tables,
         legacy_max_dev=legacy_max_dev,
-        data_logger=serial_logger,
-        frame_start_marker=cfg.get("frame_start_marker", '{"timestamp":')
+        data_logger=serial_logger
     )
 
     win.show()
