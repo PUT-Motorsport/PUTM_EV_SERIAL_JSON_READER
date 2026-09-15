@@ -1,5 +1,6 @@
-import sys
+import sys  # noqa: I001
 import json
+import msgpack
 import time
 import csv
 import os
@@ -24,7 +25,7 @@ except ImportError:
     McapWriter = None
     MCAP_AVAILABLE = False
 
-from PyQt5.QtWidgets import (
+from PyQt5.QtWidgets import (  # noqa: I001
     QApplication, QWidget, QVBoxLayout, QHBoxLayout, QLabel, QTableWidget,
     QTableWidgetItem, QHeaderView, QScrollArea, QLineEdit, QPushButton,
     QListWidget, QSizePolicy, QGridLayout, QFrame, QSplitter
@@ -886,7 +887,10 @@ def load_config(path="config.yaml"):
 
         # Strong frame boundary used to recover from missing/spurious newlines.
         # Set to null in YAML to use newline-only framing.
-        "frame_start_marker": '{"timestamp":'
+        "frame_start_marker": '{"timestamp":',
+        "serialization_format": "json",
+        "start_of_text_byte": 0xAA,
+        "len_bytes": 2
     }
 
     if not path:
@@ -945,6 +949,19 @@ def load_config(path="config.yaml"):
             else:
                 marker = str(marker)
                 cfg["frame_start_marker"] = marker if marker else None
+
+        if "serialization_format" in data:
+            cfg["serialization_format"] = str(data["serialization_format"]).lower()
+
+        if "start_of_text_byte" in data:
+            val = data["start_of_text_byte"]
+            if isinstance(val, str):
+                cfg["start_of_text_byte"] = int(val, 0)
+            else:
+                cfg["start_of_text_byte"] = int(val)
+
+        if "len_bytes" in data:
+            cfg["len_bytes"] = int(data["len_bytes"])
 
         if "buttons" in data and isinstance(data["buttons"], list):
             norm = []
@@ -1036,12 +1053,20 @@ def load_config(path="config.yaml"):
 class SerialWorker(QObject):
     data_received = pyqtSignal(dict)
 
-    def __init__(self, port="/dev/ttyUSB0", baudrate=500000, data_logger=None, frame_start_marker='{"timestamp":'):
+    def __init__(
+        self, port="/dev/ttyUSB0", baudrate=500000, data_logger=None,
+        frame_start_marker='{"timestamp":', serialization_format="json",
+        start_of_text_byte=0xAA, len_bytes=2
+    ):
         super().__init__()
 
         self.port = port
         self.baudrate = baudrate
         self.data_logger = data_logger
+        self.serialization_format = str(serialization_format).lower()
+        self.start_of_text_byte = start_of_text_byte
+        self.len_bytes = len_bytes
+
         if frame_start_marker is None:
             self.frame_start_marker = None
         elif isinstance(frame_start_marker, bytes):
@@ -1194,6 +1219,56 @@ class SerialWorker(QObject):
             # Successfully consumed one complete newline-delimited frame; loop
             # again because more bytes may already be buffered.
 
+    def _parse_msgpack_candidate(self, raw_frame):
+        payload = raw_frame[1 + self.len_bytes:]
+        try:
+            data = msgpack.unpackb(payload, raw=False)
+            if not isinstance(data, dict):
+                raise ValueError("Parsed msgpack data is not a dictionary")
+        except Exception as e:
+            logger.warning(
+                "Invalid msgpack frame (%d bytes, error: %s).",
+                len(raw_frame), e
+            )
+            if self.data_logger:
+                self.data_logger.log_invalid_frame(self.port, raw_frame, e)
+            return False
+
+        if self.data_logger:
+            self.data_logger.log_received(self.port, data, raw_json=None)
+        
+        self.data_received.emit(data)
+        return True
+
+    def _drain_msgpack_frames(self, rx_buffer):
+        while True:
+            first = rx_buffer.find(bytes([self.start_of_text_byte]))
+            if first < 0:
+                rx_buffer.clear()
+                return
+            
+            if first > 0:
+                noise = bytes(rx_buffer[:first])
+                logger.warning(
+                    "Resynchronizing msgpack stream: discarded %d bytes before 0x%02x",
+                    first, self.start_of_text_byte
+                )
+                del rx_buffer[:first]
+            
+            if len(rx_buffer) < 1 + self.len_bytes:
+                return
+            
+            length_bytes = rx_buffer[1:1 + self.len_bytes]
+            payload_len = int.from_bytes(length_bytes, byteorder='little')
+            
+            total_frame_len = 1 + self.len_bytes + payload_len
+            if len(rx_buffer) < total_frame_len:
+                return
+            
+            candidate = bytes(rx_buffer[:total_frame_len])
+            del rx_buffer[:total_frame_len]
+            self._parse_msgpack_candidate(candidate)
+
     def _drain_newline_frames(self, rx_buffer):
         while True:
             newline = rx_buffer.find(b"\n")
@@ -1240,7 +1315,9 @@ class SerialWorker(QObject):
                 bytes_read += len(chunk)
                 rx_buffer.extend(chunk)
 
-                if self.frame_start_marker:
+                if self.serialization_format == "msgpack":
+                    self._drain_msgpack_frames(rx_buffer)
+                elif self.frame_start_marker:
                     self._drain_marker_frames(rx_buffer)
                 else:
                     self._drain_newline_frames(rx_buffer)
@@ -1603,7 +1680,10 @@ class App(QWidget):
         legacy_tables=None,
         legacy_max_dev=0.05,
         data_logger=None,
-        frame_start_marker='{"timestamp":'
+        frame_start_marker='{"timestamp":',
+        serialization_format="json",
+        start_of_text_byte=0xAA,
+        len_bytes=2
     ):
         super().__init__()
 
@@ -1721,7 +1801,10 @@ class App(QWidget):
             port=port,
             baudrate=baudrate,
             data_logger=self.data_logger,
-            frame_start_marker=frame_start_marker
+            frame_start_marker=frame_start_marker,
+            serialization_format=serialization_format,
+            start_of_text_byte=start_of_text_byte,
+            len_bytes=len_bytes
         )
 
         self.thread = QThread()
@@ -1924,7 +2007,10 @@ if __name__ == "__main__":
         legacy_tables=legacy_tables,
         legacy_max_dev=legacy_max_dev,
         data_logger=serial_logger,
-        frame_start_marker=cfg.get("frame_start_marker", '{"timestamp":')
+        frame_start_marker=cfg.get("frame_start_marker", '{"timestamp":'),
+        serialization_format=cfg.get("serialization_format", "json"),
+        start_of_text_byte=cfg.get("start_of_text_byte", 0xAA),
+        len_bytes=cfg.get("len_bytes", 2)
     )
 
     win.show()

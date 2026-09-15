@@ -1,7 +1,10 @@
-COM: "COM3"         # or "/dev/ttyUSB0"
+COM: "/dev/ttyUSB0"         # or "/dev/ttyUSB0"
 BAUD: 460800        # optional; defaults to 500000
 precision: 3     # max digits after the dot for floats in tables
 log_format: "mcap" # fill with csv if you dont have mcap support 
+serialization_format: "msgpack" # "msgpack" or "json"
+start_of_text_byte: 0xAA
+len_bytes: 2 # bytes after start_of_text_byte, little endian
 heatmaps:
   - name: "cell_voltages"
     max_deviation: 0.008   # ±5%
@@ -10,10 +13,6 @@ heatmaps:
   - name: "cell_balancing"
     max_deviation: 0.05
 buttons:
-  - name: "Service Mode On"
-    value: "{\"command\": \"service_mode_on\"}"
-  - name: "Service Mode Off"
-    value: "{\"command\": \"service_mode_off\"}"
   - name: "Charger On"
     value: "{\"command\": \"charger_on\"}"
   - name: "Charger Off"

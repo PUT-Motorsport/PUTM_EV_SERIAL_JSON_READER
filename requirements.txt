@@ -2,3 +2,4 @@ PyQt5
 pyserial
 PyYAML
 mcap
+msgpack
