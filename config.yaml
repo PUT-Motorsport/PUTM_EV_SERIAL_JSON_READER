@@ -2,9 +2,9 @@ COM: "/dev/ttyUSB0"         # or "/dev/ttyUSB0"
 BAUD: 460800        # optional; defaults to 500000
 precision: 3     # max digits after the dot for floats in tables
 log_format: "mcap" # fill with csv if you dont have mcap support 
-serialization_format: "msgpack" # "msgpack" or "json"
-start_of_text_byte: 0xAA
-len_bytes: 2 # bytes after start_of_text_byte, little endian
+serialization_format: "json" # "msgpack" or "json"
+start_of_text_byte: 0xAA # in msgpack mode for format: start_of_text_byte + len_bytes + payload
+len_bytes: 2 # bytes after start_of_text_byte in msgpack mode, little endian
 heatmaps:
   - name: "cell_voltages"
     max_deviation: 0.008   # ±5%
