@@ -1056,7 +1056,7 @@ class SerialWorker(QObject):
     def __init__(
         self, port="/dev/ttyUSB0", baudrate=500000, data_logger=None,
         frame_start_marker='{"timestamp":', serialization_format="json",
-        start_of_text_byte=0xAA, len_bytes=2
+        start_of_text_byte=0xAA, len_bytes=2, precision=3
     ):
         super().__init__()
 
@@ -1066,6 +1066,7 @@ class SerialWorker(QObject):
         self.serialization_format = str(serialization_format).lower()
         self.start_of_text_byte = start_of_text_byte
         self.len_bytes = len_bytes
+        self.precision = int(precision) if precision is not None else 3
 
         if frame_start_marker is None:
             self.frame_start_marker = None
@@ -1219,12 +1220,22 @@ class SerialWorker(QObject):
             # Successfully consumed one complete newline-delimited frame; loop
             # again because more bytes may already be buffered.
 
+    def _round_floats(self, value):
+        if isinstance(value, float):
+            return round(value, self.precision)
+        if isinstance(value, list):
+            return [self._round_floats(item) for item in value]
+        if isinstance(value, dict):
+            return {k: self._round_floats(v) for k, v in value.items()}
+        return value
+
     def _parse_msgpack_candidate(self, raw_frame):
         payload = raw_frame[1 + self.len_bytes:]
         try:
             data = msgpack.unpackb(payload, raw=False)
             if not isinstance(data, dict):
                 raise ValueError("Parsed msgpack data is not a dictionary")
+            data = self._round_floats(data)
         except Exception as e:
             logger.warning(
                 "Invalid msgpack frame (%d bytes, error: %s).",
@@ -1814,7 +1825,8 @@ class App(QWidget):
             frame_start_marker=frame_start_marker,
             serialization_format=serialization_format,
             start_of_text_byte=start_of_text_byte,
-            len_bytes=len_bytes
+            len_bytes=len_bytes,
+            precision=precision
         )
 
         self.thread = QThread()
@@ -1911,6 +1923,11 @@ class App(QWidget):
         self.table_viewer.display_tables(data)
         self.render_non_table(data)
 
+    def _format_non_table_value(self, value):
+        if isinstance(value, float):
+            return self.table_viewer._format_for_display(value)
+        return str(value)
+
     def render_non_table(self, data):
         entries = []
 
@@ -1918,11 +1935,11 @@ class App(QWidget):
             for key, value in data.items():
                 if isinstance(value, list) and self.table_viewer.is_2d_array(value):
                     continue
-                entries.append((str(key), str(value)))
+                entries.append((str(key), self._format_non_table_value(value)))
         elif isinstance(data, list):
-            entries.append(("value", str(data)))
+            entries.append(("value", self._format_non_table_value(data)))
         else:
-            entries.append(("value", str(data)))
+            entries.append(("value", self._format_non_table_value(data)))
 
         keys = tuple(key for key, _value in entries)
 
