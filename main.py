@@ -1,4 +1,4 @@
-import sys  # noqa: I001
+import sys
 import json
 import msgpack
 import time
@@ -25,7 +25,7 @@ except ImportError:
     McapWriter = None
     MCAP_AVAILABLE = False
 
-from PyQt5.QtWidgets import (  # noqa: I001
+from PyQt5.QtWidgets import (
     QApplication, QWidget, QVBoxLayout, QHBoxLayout, QLabel, QTableWidget,
     QTableWidgetItem, QHeaderView, QScrollArea, QLineEdit, QPushButton,
     QListWidget, QSizePolicy, QGridLayout, QFrame, QSplitter
@@ -1389,17 +1389,7 @@ class SerialWorker(QObject):
                 return False
 
             try:
-                if getattr(self, "serialization_format", "json") == "msgpack":
-                    try:
-                        cmd_data = json.loads(cmd)
-                    except json.JSONDecodeError:
-                        cmd_data = cmd
-                    payload = msgpack.packb(cmd_data, use_bin_type=True)
-                    length_bytes = len(payload).to_bytes(getattr(self, "len_bytes", 2), byteorder='little')
-                    frame = bytes([getattr(self, "start_of_text_byte", 0xAA)]) + length_bytes + payload
-                    self.serial_port.write(frame)
-                else:
-                    self.serial_port.write((cmd + "\n").encode("utf-8"))
+                self.serial_port.write((cmd + "\n").encode("utf-8"))
                 self.serial_port.flush()
 
                 logger.info("Sent command: %s", cmd)
