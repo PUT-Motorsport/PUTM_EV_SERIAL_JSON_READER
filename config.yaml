@@ -1,4 +1,4 @@
-COM: "/dev/ttyUSB0"         # or "/dev/ttyUSB0"
+COM: "COM3"         # or "/dev/ttyUSB0"
 BAUD: 460800        # optional; defaults to 500000
 precision: 3     # max digits after the dot for floats
 log_format: "mcap" # fill with csv if you dont have mcap support 
@@ -31,5 +31,7 @@ buttons:
     value: "{\"command\": \"balancing_on\"}"
   - name: "Balancing Off"
     value: "{\"command\": \"balancing_off\"}"
-  
-
+  - name: "Set JSON serialization mode"
+    value: "{\"command\": \"serialization_mode\", \"value\":\"json\"}"  
+  - name: "Set MSGPACK serialization mode"
+    value: "{\"command\": \"serialization_mode\", \"value\":\"msgpack\"}"
