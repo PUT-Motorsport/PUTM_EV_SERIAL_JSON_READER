@@ -1468,6 +1468,19 @@ class TableViewer(QWidget):
             and all(len(r) == len(arr[0]) for r in arr)
         )
 
+    def is_1d_numeric_array(self, arr):
+        return (
+            isinstance(arr, list)
+            and len(arr) >= 2
+            and all(
+                isinstance(v, (int, float)) and not isinstance(v, bool)
+                for v in arr
+            )
+        )
+
+    def is_table_value(self, value):
+        return self.is_2d_array(value) or self.is_1d_numeric_array(value)
+
     def _collect_tables(self, data, prefix=""):
         found = []
 
@@ -1477,6 +1490,9 @@ class TableViewer(QWidget):
 
                 if isinstance(value, list) and self.is_2d_array(value):
                     found.append((path, str(key), value))
+                elif self.is_1d_numeric_array(value):
+                    # Flat numeric list -> single-row (1xn) table.
+                    found.append((path, str(key), [value]))
                 elif isinstance(value, (dict, list)):
                     found.extend(self._collect_tables(value, path))
 
@@ -1923,7 +1939,7 @@ class App(QWidget):
 
         if isinstance(data, dict):
             for key, value in data.items():
-                if isinstance(value, list) and self.table_viewer.is_2d_array(value):
+                if isinstance(value, list) and self.table_viewer.is_table_value(value):
                     continue
                 entries.append((str(key), self._format_non_table_value(value)))
         elif isinstance(data, list):
