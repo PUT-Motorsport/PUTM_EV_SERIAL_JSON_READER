@@ -1631,6 +1631,7 @@ class TableViewer(QWidget):
 
         avg = sum(nums) / len(nums) if nums else 0.0
         red_cap_factor = 5.0
+        fm = table.fontMetrics()
 
         for i, row in enumerate(table_data):
             for j, raw_val in enumerate(row):
@@ -1642,6 +1643,10 @@ class TableViewer(QWidget):
                 display_text = self._format_for_display(raw_val)
                 if item.text() != display_text:
                     item.setText(display_text)
+
+                    needed = fm.horizontalAdvance(display_text) + 16
+                    if needed > table.columnWidth(j):
+                        table.setColumnWidth(j, needed)
 
                 # Calculate the desired heatmap color, but only touch Qt's
                 # background role when the resulting color actually changes.
