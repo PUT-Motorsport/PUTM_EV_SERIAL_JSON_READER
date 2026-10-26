@@ -890,7 +890,8 @@ def load_config(path="config.yaml"):
         "frame_start_marker": '{"timestamp":',
         "serialization_format": "json",
         "start_of_text_byte": 0xAA,
-        "len_bytes": 2
+        "len_bytes": 2,
+        "max_payload_len": 4096
     }
 
     if not path:
@@ -962,6 +963,9 @@ def load_config(path="config.yaml"):
 
         if "len_bytes" in data:
             cfg["len_bytes"] = int(data["len_bytes"])
+
+        if "max_payload_len" in data:
+            cfg["max_payload_len"] = int(data["max_payload_len"])
 
         if "buttons" in data and isinstance(data["buttons"], list):
             norm = []
@@ -1056,7 +1060,8 @@ class SerialWorker(QObject):
     def __init__(
         self, port="/dev/ttyUSB0", baudrate=500000, data_logger=None,
         frame_start_marker='{"timestamp":', serialization_format="json",
-        start_of_text_byte=0xAA, len_bytes=2, precision=3
+        start_of_text_byte=0xAA, len_bytes=2, precision=3,
+        max_payload_len=4096
     ):
         super().__init__()
 
@@ -1066,6 +1071,7 @@ class SerialWorker(QObject):
         self.serialization_format = str(serialization_format).lower()
         self.start_of_text_byte = start_of_text_byte
         self.len_bytes = len_bytes
+        self.max_payload_len = int(max_payload_len)
         self.precision = int(precision) if precision is not None else 3
 
         if frame_start_marker is None:
@@ -1272,13 +1278,28 @@ class SerialWorker(QObject):
             length_bytes = rx_buffer[1:1 + self.len_bytes]
             payload_len = int.from_bytes(length_bytes, byteorder='little')
             
+            if payload_len > self.max_payload_len:
+                # Corrupted length (or a 0xAA inside data): do not wait for
+                # bytes that will never come, resynchronize on the next start byte.
+                logger.warning(
+                    "Implausible msgpack payload length %d (max %d), resynchronizing",
+                    payload_len, self.max_payload_len
+                )
+                del rx_buffer[:1]
+                continue
+
             total_frame_len = 1 + self.len_bytes + payload_len
             if len(rx_buffer) < total_frame_len:
                 return
-            
+
             candidate = bytes(rx_buffer[:total_frame_len])
-            del rx_buffer[:total_frame_len]
-            self._parse_msgpack_candidate(candidate)
+            if self._parse_msgpack_candidate(candidate):
+                del rx_buffer[:total_frame_len]
+            else:
+                # The length field may be corrupted, so the real next frame
+                # can lie inside this candidate. Skip only the start byte and
+                # resynchronize on the next one.
+                del rx_buffer[:1]
 
     def _drain_newline_frames(self, rx_buffer):
         while True:
@@ -1715,7 +1736,8 @@ class App(QWidget):
         frame_start_marker='{"timestamp":',
         serialization_format="json",
         start_of_text_byte=0xAA,
-        len_bytes=2
+        len_bytes=2,
+        max_payload_len=4096
     ):
         super().__init__()
 
@@ -1837,6 +1859,7 @@ class App(QWidget):
             serialization_format=serialization_format,
             start_of_text_byte=start_of_text_byte,
             len_bytes=len_bytes,
+            max_payload_len=max_payload_len,
             precision=precision
         )
 
@@ -2048,7 +2071,8 @@ if __name__ == "__main__":
         frame_start_marker=cfg.get("frame_start_marker", '{"timestamp":'),
         serialization_format=cfg.get("serialization_format", "json"),
         start_of_text_byte=cfg.get("start_of_text_byte", 0xAA),
-        len_bytes=cfg.get("len_bytes", 2)
+        len_bytes=cfg.get("len_bytes", 2),
+        max_payload_len=cfg.get("max_payload_len", 4096)
     )
 
     win.show()
